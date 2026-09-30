@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -39,6 +40,8 @@ type config struct {
 	cluster      string
 	secretFile   string
 	secret       string
+	pairingFile  string
+	pairingToken string
 	authDB       string
 	mmogDB       string
 	legacyDB     string
@@ -48,6 +51,7 @@ type config struct {
 	tlsCert      string
 	tlsKey       string
 	interval     time.Duration
+	rotateDays   int
 }
 
 func loadConfig() config {
@@ -55,11 +59,21 @@ func loadConfig() config {
 	if v, err := time.ParseDuration(os.Getenv("SYNC_INTERVAL")); err == nil && v >= 10*time.Second {
 		interval = v
 	}
+	rotateDays := 30
+	if v, err := strconv.Atoi(strings.TrimSpace(os.Getenv("SYNC_ROTATE_DAYS"))); err == nil && v >= 0 {
+		rotateDays = v
+	}
 	return config{
 		masterURL:  strings.TrimRight(strings.TrimSpace(os.Getenv("SYNC_MASTER_URL")), "/"),
 		cluster:    strings.TrimSpace(os.Getenv("CLUSTER_NAME")),
 		secretFile: getenv("SYNC_SECRET_FILE", "run/sync.env"),
 		secret:     strings.TrimSpace(os.Getenv("SYNC_SECRET")),
+		// One-time pairing token (operator mints it on the directory
+		// dashboard): exchanged for the cluster secret on first contact,
+		// then useless (burned server-side). Env covers secrets.env when
+		// the starter sources it; the file is the hand path.
+		pairingFile:  getenv("SYNC_PAIRING_FILE", "run/pairing.env"),
+		pairingToken: strings.TrimSpace(os.Getenv("PAIRING_TOKEN")),
 		authDB:     getenv("AUTH_DB", "run/auth.db"),
 		mmogDB:     getenv("MMOG_DB", "run/mmog.db"),
 		legacyDB:   getenv("LEGACY_DB", "run/legacy.db"),
@@ -72,6 +86,7 @@ func loadConfig() config {
 		tlsCert:      getenv("TLS_CERT", "certs/server.crt"),
 		tlsKey:       getenv("TLS_KEY", "certs/server.key"),
 		interval:     interval,
+		rotateDays:   rotateDays,
 	}
 }
 
@@ -82,8 +97,9 @@ func getenv(key, fallback string) string {
 	return fallback
 }
 
-// loadSecret reads run/sync.env (written by the /sync/key endpoint or by
-// hand), with SYNC_SECRET env overriding for containers.
+// loadSecret reads run/sync.env (written by the /sync/key endpoint, by the
+// pairing exchange, or by hand), with SYNC_SECRET env overriding for
+// containers.
 func loadSecret(cfg config) string {
 	if cfg.secret != "" {
 		return cfg.secret
@@ -97,6 +113,51 @@ func loadSecret(cfg config) string {
 		if strings.HasPrefix(line, "SYNC_SECRET=") {
 			return strings.TrimSpace(strings.TrimPrefix(line, "SYNC_SECRET="))
 		}
+	}
+	return ""
+}
+
+// absPath resolves a config path for log messages, so a missing secret file
+// names the exact place instead of a relative guess (the classic restart
+// confusion: right file, wrong working directory).
+func absPath(p string) string {
+	if abs, err := filepath.Abs(p); err == nil {
+		return abs
+	}
+	return p
+}
+
+// secretStatus logs what the agent found at startup: source and length, never
+// the value. A missing secret after a restart names its file outright.
+func secretStatus(cfg config, log *logrus.Logger) string {
+	if cfg.secret != "" {
+		log.Info("sync secret: from SYNC_SECRET env")
+		return cfg.secret
+	}
+	secret := loadSecret(cfg)
+	if secret == "" {
+		log.WithField("file", absPath(cfg.secretFile)).Warn("no sync secret yet: waiting for pairing (/sync/pair) or the directory operator — see the master dashboard secret button")
+		return ""
+	}
+	log.WithFields(logrus.Fields{"file": absPath(cfg.secretFile), "chars": len(secret)}).Info("sync secret: loaded from file")
+	return secret
+}
+
+// loadPairing reads the one-time pairing token: PAIRING_TOKEN env first,
+// then run/pairing.env (PAIRING_TOKEN=… or the bare token, first line).
+// Empty means no pairing configured.
+func loadPairing(cfg config) string {
+	if cfg.pairingToken != "" {
+		return cfg.pairingToken
+	}
+	raw, err := os.ReadFile(cfg.pairingFile)
+	if err != nil {
+		return ""
+	}
+	first := strings.TrimSpace(strings.SplitN(string(raw), "\n", 2)[0])
+	first = strings.TrimSpace(strings.TrimPrefix(first, "PAIRING_TOKEN="))
+	if fields := strings.Fields(first); len(fields) > 0 {
+		return fields[0]
 	}
 	return ""
 }
@@ -126,9 +187,10 @@ type agent struct {
 const syncTriggerWindow = 10 * time.Second
 
 type syncState struct {
-	LastPull string            `json:"last_pull"`
-	PushedAt string            `json:"pushed_at"`
-	Users    map[string]string `json:"users"`
+	LastPull  string            `json:"last_pull"`
+	PushedAt  string            `json:"pushed_at"`
+	Users     map[string]string `json:"users"`
+	RotatedAt string            `json:"rotated_at"`
 }
 
 func loadState(path string) syncState {
@@ -156,10 +218,7 @@ func main() {
 	if cfg.masterURL == "" || cfg.cluster == "" {
 		log.Fatal("SYNC_MASTER_URL and CLUSTER_NAME must be set (see run/secrets.env)")
 	}
-	secret := loadSecret(cfg)
-	if secret == "" {
-		log.Warn("no sync secret yet (run/sync.env): waiting for the directory operator — see the master dashboard secret button")
-	}
+	secretStatus(cfg, log)
 
 	authDB, err := openDB(cfg.authDB)
 	if err != nil {
@@ -336,6 +395,94 @@ func (a *agent) handleSyncNow(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// storeSecret writes a secret to the secret file (0600), honouring
+// first-write-wins: if a secret appeared meanwhile (hand edit, operator
+// push), the newcomer yields instead of clobbering it.
+func (a *agent) storeSecret(secret, via string) bool {
+	if loadSecret(a.cfg) != "" {
+		return false
+	}
+	if dir := filepath.Dir(a.cfg.secretFile); dir != "" {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			a.log.WithError(err).Warn("sync: cannot store secret")
+			return false
+		}
+	}
+	if err := os.WriteFile(a.cfg.secretFile, []byte("SYNC_SECRET="+secret+"\n"), 0o600); err != nil {
+		a.log.WithError(err).Warn("sync: cannot store secret")
+		return false
+	}
+	a.log.WithField("via", via).Info("sync secret stored")
+	return true
+}
+
+// tryPair exchanges the one-time pairing token for the cluster secret.
+// Single use server-side; on success the local pairing file is removed so a
+// stale token cannot confuse the next operator.
+func (a *agent) tryPair() {
+	token := loadPairing(a.cfg)
+	if token == "" {
+		return
+	}
+	var out struct {
+		Secret string `json:"secret"`
+		Status string `json:"status"`
+	}
+	if err := a.post("/sync/pair", map[string]any{"token": token}, "", &out); err != nil {
+		a.log.WithError(err).Warn("sync: pairing exchange failed (token burned? expired? ask the directory operator for a fresh one)")
+		return
+	}
+	if len(out.Secret) < 16 {
+		a.log.Warn("sync: pairing answered without a usable secret")
+		return
+	}
+	if a.storeSecret(out.Secret, "pairing") {
+		_ = os.Remove(a.cfg.pairingFile)
+	}
+}
+
+// maybeRotate trades the current secret for a fresh one when the rotation
+// interval elapsed (SYNC_ROTATE_DAYS, 0 disables). A failed rotation keeps
+// the old secret and retries next loop — never a lockout.
+func (a *agent) maybeRotate(secret string, st *syncState) string {
+	if a.cfg.rotateDays <= 0 {
+		return secret
+	}
+	if st.RotatedAt == "" {
+		// First sight of this secret (paired or hand-placed): start the
+		// clock instead of rotating a brand-new secret immediately.
+		st.RotatedAt = time.Now().UTC().Format(time.RFC3339)
+		return secret
+	}
+	if st.RotatedAt != "" {
+		if ts, err := time.Parse(time.RFC3339, st.RotatedAt); err == nil {
+			if time.Since(ts) < time.Duration(a.cfg.rotateDays)*24*time.Hour {
+				return secret
+			}
+		}
+	}
+	var out struct {
+		Secret string `json:"secret"`
+		Status string `json:"status"`
+	}
+	if err := a.post("/sync/rotate", map[string]any{}, secret, &out); err != nil {
+		a.log.WithError(err).Warn("sync: rotation failed, keeping the old secret")
+		return secret
+	}
+	if len(out.Secret) < 16 {
+		return secret
+	}
+	// Replace directly (not storeSecret): rotation owns the file — but only
+	// after the master accepted, which it just did by answering.
+	if err := os.WriteFile(a.cfg.secretFile, []byte("SYNC_SECRET="+out.Secret+"\n"), 0o600); err != nil {
+		a.log.WithError(err).Warn("sync: cannot store rotated secret, keeping the old one in memory only")
+		return secret
+	}
+	st.RotatedAt = time.Now().UTC().Format(time.RFC3339)
+	a.log.Info("sync secret rotated")
+	return out.Secret
+}
+
 // loop pushes every local user, then pulls remote changes. Errors are
 // logged, never fatal: a down directory must not stop the game.
 // force applies every pulled snapshot even when it is older than local
@@ -348,9 +495,15 @@ func (a *agent) loop(st syncState, force bool) (pushed, applied int) {
 	}
 	secret := loadSecret(a.cfg)
 	if secret == "" {
-		a.log.Warn("sync skipped: no secret (waiting for operator)")
-		return 0, 0
+		// No secret yet: try the one-time pairing token before waiting.
+		a.tryPair()
+		secret = loadSecret(a.cfg)
+		if secret == "" {
+			a.log.WithField("file", absPath(a.cfg.secretFile)).Warn("sync skipped: no secret (pair a token or ask the operator)")
+			return 0, 0
+		}
 	}
+	secret = a.maybeRotate(secret, &st)
 	ids, err := userIDs(a.dbs.auth)
 	if err != nil {
 		a.log.WithError(err).Warn("sync: list users")
@@ -479,7 +632,7 @@ func (a *agent) authed(path, secret string, body io.Reader) (*http.Request, erro
 	return req, nil
 }
 
-func (a *agent) post(path string, payload any, secret string, out *map[string]any) error {
+func (a *agent) post(path string, payload any, secret string, out any) error {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return err

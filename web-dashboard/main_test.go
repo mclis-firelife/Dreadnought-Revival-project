@@ -560,6 +560,114 @@ func TestStatsProxiesPassThrough(t *testing.T) {
 	}
 }
 
+func TestConfigKeysMerge(t *testing.T) {
+	root := t.TempDir()
+	s := controlTestServer(t, root)
+	t.Setenv("REPO_ROOT", root)
+	base := "# comment\nPLAYERS_PER_MATCH=1\nJWT_SECRET=keepme\n"
+	if err := os.WriteFile(filepath.Join(root, "run", "secrets.env"), []byte(base), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	s.apiConfigKeys(rec, httptest.NewRequest(http.MethodGet, "/api/config-keys", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "PLAYERS_PER_MATCH") {
+		t.Fatalf("list: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	s.apiSetConfigKeys(rec, httptest.NewRequest(http.MethodPost, "/api/config-keys",
+		strings.NewReader(`{"values":{"PLAYERS_PER_MATCH":"4","DN_REWARD_WIN_CREDITS":"2000"}}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("save: %d %s", rec.Code, rec.Body.String())
+	}
+	raw, _ := os.ReadFile(filepath.Join(root, "run", "secrets.env"))
+	content := string(raw)
+	if !strings.Contains(content, "PLAYERS_PER_MATCH=4") || !strings.Contains(content, "DN_REWARD_WIN_CREDITS=2000") {
+		t.Fatalf("not merged: %q", content)
+	}
+	if !strings.Contains(content, "# comment") || !strings.Contains(content, "JWT_SECRET=keepme") {
+		t.Fatalf("comments/secrets lost: %q", content)
+	}
+	// Non-whitelisted keys are refused, even with valid ones mixed in.
+	rec = httptest.NewRecorder()
+	s.apiSetConfigKeys(rec, httptest.NewRequest(http.MethodPost, "/api/config-keys",
+		strings.NewReader(`{"values":{"JWT_SECRET":"hacked"}}`)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("secret overwrite: got %d, want 400", rec.Code)
+	}
+}
+
+func TestScheduledCRUD(t *testing.T) {
+	s := testServer()
+	dir := t.TempDir()
+	s.cfg.runDir = dir
+	add := func(body string) (int, map[string]any) {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		s.apiScheduled(rec, httptest.NewRequest(http.MethodPost, "/api/scheduled", strings.NewReader(body)))
+		var doc map[string]any
+		_ = json.Unmarshal(rec.Body.Bytes(), &doc)
+		return rec.Code, doc
+	}
+	future := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	if code, _ := add(`{"at":"not-a-time","kind":"broadcast","body":"hi"}`); code != http.StatusBadRequest {
+		t.Fatalf("bad time: got %d, want 400", code)
+	}
+	if code, _ := add(`{"at":"` + future + `","kind":"broadcast","body":""}`); code != http.StatusBadRequest {
+		t.Fatalf("empty body: got %d, want 400", code)
+	}
+	code, doc := add(`{"at":"` + future + `","kind":"broadcast","body":"hello","channel":"global"}`)
+	if code != http.StatusOK {
+		t.Fatalf("add: %d %v", code, doc)
+	}
+	id, _ := doc["id"].(string)
+	if id == "" {
+		t.Fatalf("no id back: %v", doc)
+	}
+	rec := httptest.NewRecorder()
+	s.apiScheduled(rec, httptest.NewRequest(http.MethodGet, "/api/scheduled", nil))
+	var list struct {
+		Items []scheduledItem `json:"items"`
+		Count int             `json:"count"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil || list.Count != 1 {
+		t.Fatalf("list: %v (%s)", err, rec.Body.String())
+	}
+	req := httptest.NewRequest(http.MethodDelete, "/api/scheduled/"+id, nil)
+	req = mux.SetURLVars(req, map[string]string{"id": id})
+	rec = httptest.NewRecorder()
+	s.apiDeleteScheduled(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPlayerHistoryGrepsAudit(t *testing.T) {
+	s := auditTestServer(t, t.TempDir())
+	s.audit("grant", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	s.audit("ban", "somebody-else")
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/player-history?id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", nil)
+	s.apiPlayerHistory(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d", rec.Code)
+	}
+	var doc struct {
+		Entries []map[string]string `json:"entries"`
+		Count   int                 `json:"count"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if doc.Count != 1 || doc.Entries[0]["action"] != "grant" {
+		t.Fatalf("unexpected history: %s", rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	s.apiPlayerHistory(rec, httptest.NewRequest(http.MethodGet, "/api/player-history", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("no id: got %d, want 400", rec.Code)
+	}
+}
+
 func controlTestServer(t *testing.T, root string) *server {
 	t.Helper()
 	s := testServer()

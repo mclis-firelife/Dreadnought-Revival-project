@@ -606,6 +606,185 @@ func TestAdminSources(t *testing.T) {
 	}
 }
 
+func roamCall(t *testing.T, h *Handler, path, key, body string) (int, map[string]any) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+	if key != "" {
+		req.Header.Set("X-Sync-Key", key)
+	}
+	rec := httptest.NewRecorder()
+	switch {
+	case strings.HasSuffix(path, "/delegate"):
+		h.SyncRoamDelegate(rec, req)
+	default:
+		h.SyncRoamVerify(rec, req)
+	}
+	var doc map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &doc)
+	return rec.Code, doc
+}
+
+func TestRoamDelegateVerify(t *testing.T) {
+	h := testHandler(t)
+	seedSyncCluster(t, h)
+	uid := "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	rec, req := authedSyncReq(t, "POST", "/sync/push", pushPayload(uid, "2026-09-29T10:00:00Z"), syncTestKey)
+	h.SyncPush(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("push: %d", rec.Code)
+	}
+	// Unknown cluster key: denied on both ends.
+	if code, _ := roamCall(t, h, "/roam/delegate", "nope", `{"user_id":"`+uid+`"}`); code != http.StatusForbidden {
+		t.Fatalf("delegate bad key: got %d, want 403", code)
+	}
+	if code, _ := roamCall(t, h, "/roam/verify", "nope", `{"ticket":"x"}`); code != http.StatusForbidden {
+		t.Fatalf("verify bad key: got %d, want 403", code)
+	}
+	// Unknown account: not mirrored yet.
+	if code, _ := roamCall(t, h, "/roam/delegate", syncTestKey, `{"user_id":"00000000000000000000000000000000"}`); code != http.StatusNotFound {
+		t.Fatalf("delegate unknown user: got %d, want 404", code)
+	}
+	// Delegate (dashed id spelling accepted too), then verify.
+	code, doc := roamCall(t, h, "/roam/delegate", syncTestKey, `{"user_id":"eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"}`)
+	if code != http.StatusOK {
+		t.Fatalf("delegate: %d %v", code, doc)
+	}
+	ticket, _ := doc["ticket"].(string)
+	if len(ticket) != 48 || doc["username"] != "alice" {
+		t.Fatalf("bad ticket doc: %v", doc)
+	}
+	code, doc = roamCall(t, h, "/roam/verify", syncTestKey, `{"ticket":"`+ticket+`"}`)
+	if code != http.StatusOK || doc["user_id"] != uid || doc["username"] != "alice" {
+		t.Fatalf("verify: %d %v", code, doc)
+	}
+	// Reuse within expiry is fine (one user, several clusters in a row).
+	if code, _ := roamCall(t, h, "/roam/verify", syncTestKey, `{"ticket":"`+ticket+`"}`); code != http.StatusOK {
+		t.Fatalf("verify reuse: got %d, want 200", code)
+	}
+	// Unknown ticket denied.
+	if code, _ := roamCall(t, h, "/roam/verify", syncTestKey, `{"ticket":"`+strings.Repeat("0", 48)+`"}`); code != http.StatusForbidden {
+		t.Fatalf("unknown ticket: got %d, want 403", code)
+	}
+	// Expired ticket pruned on sight.
+	if _, err := h.DB.Exec(`UPDATE roam_tickets SET expires_at='2020-01-01 00:00:00'`); err != nil {
+		t.Fatal(err)
+	}
+	if code, _ := roamCall(t, h, "/roam/verify", syncTestKey, `{"ticket":"`+ticket+`"}`); code != http.StatusForbidden {
+		t.Fatalf("expired ticket: got %d, want 403", code)
+	}
+}
+
+func mintPairToken(t *testing.T, h *Handler, id string) string {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/clusters/"+id+"/pair", nil)
+	req = mux.SetURLVars(req, map[string]string{"id": id})
+	rec := httptest.NewRecorder()
+	h.AdminPair(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("pair mint: %d %s", rec.Code, rec.Body.String())
+	}
+	var doc struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil || len(doc.Token) != 48 {
+		t.Fatalf("no token back: %s", rec.Body.String())
+	}
+	return doc.Token
+}
+
+func pairExchange(t *testing.T, h *Handler, token string) (int, map[string]any) {
+	t.Helper()
+	raw, _ := json.Marshal(map[string]string{"token": token})
+	rec := httptest.NewRecorder()
+	h.SyncPair(rec, httptest.NewRequest(http.MethodPost, "/sync/pair", strings.NewReader(string(raw))))
+	var doc map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &doc)
+	return rec.Code, doc
+}
+
+func TestSyncPairFlow(t *testing.T) {
+	h := testHandler(t)
+	id := seedSyncCluster(t, h)
+	token := mintPairToken(t, h, id)
+
+	code, doc := pairExchange(t, h, token)
+	if code != http.StatusOK {
+		t.Fatalf("pair: %d %v", code, doc)
+	}
+	secret, _ := doc["secret"].(string)
+	if len(secret) != 48 {
+		t.Fatalf("no secret back: %v", doc)
+	}
+	// The issued secret authenticates immediately.
+	rec, req := authedSyncReq(t, "POST", "/sync/push", pushPayload("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "2026-09-29T10:00:00Z"), secret)
+	h.SyncPush(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("push with paired secret: %d %s", rec.Code, rec.Body.String())
+	}
+	// Single use: replay fails.
+	if code, _ := pairExchange(t, h, token); code != http.StatusForbidden {
+		t.Fatalf("replay: got %d, want 403", code)
+	}
+	// Unknown token fails.
+	if code, _ := pairExchange(t, h, strings.Repeat("0", 48)); code != http.StatusForbidden {
+		t.Fatalf("unknown token: got %d, want 403", code)
+	}
+	// Expired token fails.
+	expiring := mintPairToken(t, h, id)
+	if _, err := h.DB.Exec(`UPDATE pairing_tokens SET expires_at='2020-01-01 00:00:00'
+		WHERE token_hash=?`, secretHash(expiring)); err != nil {
+		t.Fatal(err)
+	}
+	if code, _ := pairExchange(t, h, expiring); code != http.StatusForbidden {
+		t.Fatalf("expired token: got %d, want 403", code)
+	}
+	// Unknown cluster: 404.
+	req = httptest.NewRequest(http.MethodPost, "/admin/api/clusters/nope/pair", nil)
+	req = mux.SetURLVars(req, map[string]string{"id": "nope"})
+	rec = httptest.NewRecorder()
+	h.AdminPair(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown cluster: got %d, want 404", rec.Code)
+	}
+}
+
+func TestSyncRotate(t *testing.T) {
+	h := testHandler(t)
+	seedSyncCluster(t, h)
+	rotate := func(key string) (int, map[string]any) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/sync/rotate", nil)
+		req.Header.Set("X-Sync-Key", key)
+		rec := httptest.NewRecorder()
+		h.SyncRotate(rec, req)
+		var doc map[string]any
+		_ = json.Unmarshal(rec.Body.Bytes(), &doc)
+		return rec.Code, doc
+	}
+	if code, _ := rotate("wrong-key"); code != http.StatusForbidden {
+		t.Fatalf("bad key: got %d, want 403", code)
+	}
+	code, doc := rotate(syncTestKey)
+	if code != http.StatusOK {
+		t.Fatalf("rotate: %d %v", code, doc)
+	}
+	fresh, _ := doc["secret"].(string)
+	if len(fresh) != 48 || fresh == syncTestKey {
+		t.Fatalf("no fresh secret back: %v", doc)
+	}
+	// Old secret dies with the response; fresh one works.
+	rec, req := authedSyncReq(t, "POST", "/sync/push", pushPayload("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "2026-09-29T10:00:00Z"), syncTestKey)
+	h.SyncPush(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("old secret after rotate: got %d, want 403", rec.Code)
+	}
+	rec, req = authedSyncReq(t, "POST", "/sync/push", pushPayload("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "2026-09-29T10:00:00Z"), fresh)
+	h.SyncPush(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("fresh secret after rotate: got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestAdminUptimeVolumeGrowthErrors(t *testing.T) {
 	h := testHandler(t)
 	cid := seedSyncCluster(t, h)

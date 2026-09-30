@@ -116,7 +116,8 @@ func heartbeatReq(id, body string) *http.Request {
 	return mux.SetURLVars(req, map[string]string{"id": id})
 }
 
-func TestHeartbeatAndDeregister(t *testing.T) {	h := testHandler(t)
+func TestHeartbeatAndDeregister(t *testing.T) {
+	h := testHandler(t)
 	id := registerTestCluster(t, h, "HB Cluster")
 
 	rec := httptest.NewRecorder()
@@ -148,6 +149,48 @@ func TestHeartbeatAndDeregister(t *testing.T) {	h := testHandler(t)
 	h.List(rec, httptest.NewRequest(http.MethodGet, "/clusters", nil))
 	if !strings.Contains(rec.Body.String(), `"count":0`) {
 		t.Fatalf("cluster still listed: %s", rec.Body.String())
+	}
+}
+
+// Stop/start (or re-setup) must not orphan the sync identity: deregister
+// keeps the row, so re-registering the same name revives it WITH its
+// secret, agent URL and id.
+func TestDeregisterKeepsSecretForReregister(t *testing.T) {
+	h := testHandler(t)
+	id := registerTestCluster(t, h, "Restart Me")
+	if rec := secretReq(t, h, id, "generate"); rec.Code != http.StatusOK {
+		t.Fatalf("generate: %d", rec.Code)
+	}
+	req := httptest.NewRequest(http.MethodDelete, "/clusters/"+id, nil)
+	req = mux.SetURLVars(req, map[string]string{"id": id})
+	rec := httptest.NewRecorder()
+	h.Deregister(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("deregister status %d", rec.Code)
+	}
+	// Same name registers again (with its agent URL, like a real restart):
+	// same id, secret and agent URL intact.
+	rec = httptest.NewRecorder()
+	h.Register(rec, httptest.NewRequest(http.MethodPost, "/clusters/register",
+		strings.NewReader(registerBody("Restart Me"))))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("re-register status %d", rec.Code)
+	}
+	var again struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &again); err != nil || again.ID != id {
+		t.Fatalf("re-register id = %+v, want revived %s (%s)", again, id, rec.Body.String())
+	}
+	var hash, agent string
+	if err := h.DB.QueryRow(`SELECT secret_hash,agent_url FROM clusters WHERE id=?`,
+		id).Scan(&hash, &agent); err != nil || hash == "" || agent == "" {
+		t.Fatalf("secret/agent lost over restart: %q %q (err %v)", hash, agent, err)
+	}
+	rec = httptest.NewRecorder()
+	h.List(rec, httptest.NewRequest(http.MethodGet, "/clusters", nil))
+	if !strings.Contains(rec.Body.String(), "Restart Me") {
+		t.Fatalf("revived cluster not listed: %s", rec.Body.String())
 	}
 }
 
@@ -464,6 +507,7 @@ func registerBody(name string) string {
 	raw, _ := json.Marshal(map[string]any{
 		"name": name, "web_url": "https://play.example.org", "battle_ip": "203.0.113.7",
 		"version": "1.0", "contact_email": "owner@example.org",
+		"agent_url": "https://x.example:8093",
 	})
 	return string(raw)
 }

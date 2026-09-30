@@ -559,6 +559,104 @@ func gameInfo(exeDir string) map[string]any {
 	return map[string]any{"path": gameInstallRoot(p), "source": source}
 }
 
+// roamSource is one cluster that might vouch for the player: a directory
+// entry or a hand-added server, with everything needed to dial it.
+type roamSource struct {
+	id     string // directory id, "" for manual servers
+	name   string
+	webURL string
+	caPEM  string // cluster CA as pasted/listed ("" when unknown)
+}
+
+// TryRoam signs into the active cluster without asking for the password:
+// it walks every OTHER cluster with a saved, unexpired sign-in, takes a
+// roaming ticket there, and redeems it here. The player typed their password
+// once (on the first cluster); every later cluster is silent.
+//
+// Transport note: the game dials through one global cluster-bound transport,
+// so each grant switches it to the source and back. Calls happen while the
+// player idles on the sign-in screen — no game runs, nothing else dials.
+func (a *browserAPI) TryRoam() map[string]any {
+	a.mu.Lock()
+	active := a.active
+	var sources []roamSource
+	for _, c := range a.clusters {
+		sources = append(sources, roamSource{id: c.ID, name: c.Name, webURL: c.WebURL, caPEM: c.CACert})
+	}
+	for _, m := range a.cfg.Manual {
+		sources = append(sources, roamSource{name: m.Name, webURL: m.WebURL, caPEM: m.CACert})
+	}
+	a.mu.Unlock()
+	fail := func() map[string]any { return map[string]any{"ok": false} }
+	if active == nil {
+		return fail()
+	}
+	same := func(s roamSource) bool {
+		if active.id != "" && s.id != "" {
+			return active.id == s.id
+		}
+		return strings.EqualFold(active.webURL, s.webURL)
+	}
+	for _, src := range sources {
+		if same(src) {
+			continue
+		}
+		creds, ok := loadCredentials(clusterTrustKey(src.id, src.webURL))
+		if !ok || browserTokenExpired(creds.Token) {
+			continue
+		}
+		host, port, err := webSplit(src.webURL)
+		if err != nil {
+			continue
+		}
+		ip, err := resolveServerIP(host)
+		if err != nil {
+			continue
+		}
+		var der []byte
+		if strings.TrimSpace(src.caPEM) != "" {
+			if der, err = parseCAPEM([]byte(src.caPEM)); err != nil {
+				continue
+			}
+		}
+		if _, err := selectClusterTransport(ip, port, der); err != nil {
+			a.restoreTransport(active)
+			continue
+		}
+		ticket, _, err := roamGrant(profileAuthURL, creds.Token)
+		a.restoreTransport(active)
+		if err != nil {
+			continue
+		}
+		identifier := creds.Identifier
+		if identifier == "" {
+			identifier = creds.Username
+		}
+		newCreds, err := roamRedeem(profileAuthURL, ticket, identifier)
+		if err != nil {
+			continue
+		}
+		if err := saveCredentials(active.key, newCreds); err != nil {
+			fmt.Printf("[!] Could not remember this sign-in (%v)\n", err)
+		}
+		a.mu.Lock()
+		a.token, a.username, a.userID = newCreds.Token, newCreds.Username, newCreds.UserID
+		a.mu.Unlock()
+		return map[string]any{"ok": true, "username": newCreds.Username, "from": src.name}
+	}
+	return fail()
+}
+
+// restoreTransport points the global dialer back at the active cluster
+// (TryRoam borrows it per source). Best effort: a failed restore surfaces
+// on the next call, which re-selects anyway.
+func (a *browserAPI) restoreTransport(active *activeCluster) {
+	if active == nil {
+		return
+	}
+	_, _ = selectClusterTransport(active.ip, active.webPort, active.caDER)
+}
+
 // Play starts the game on the active cluster. ok means the game was started
 // and the front end should close.
 func (a *browserAPI) Play() map[string]any {

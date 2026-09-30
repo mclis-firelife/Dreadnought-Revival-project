@@ -474,6 +474,25 @@
       </div>
       <div id="maint-state" class="hint"></div>
     </div>
+    <div class="card glass">
+      <h2>Scheduled events</h2>
+      <p class="muted">Tiles and broadcasts with a start time (RFC3339 local, e.g. tomorrow 20:00). The dashboard fires them minute-sharp; executed items stay listed with a timestamp.</p>
+      <div class="row">
+        <select id="sched-kind"><option value="tile">Launcher tile</option><option value="tile-delete">Remove tile</option><option value="broadcast">Chat broadcast</option></select>
+        <input id="sched-at" placeholder="2026-10-01T20:00" style="width:190px">
+        <input id="sched-title" placeholder="Title (tile)" style="flex:1;min-width:160px">
+      </div>
+      <div class="row">
+        <input id="sched-body" placeholder="Body / message …" style="flex:1;min-width:240px">
+        <input id="sched-target" placeholder="Tile ID or #channel" style="width:200px">
+        <button id="sched-add" class="btn primary">Schedule</button>
+        <button id="sched-reload" class="btn">↻</button>
+      </div>
+      <div class="table-wrap"><table id="sched-table">
+        <thead><tr><th>At</th><th>Kind</th><th>Title</th><th>Target</th><th>Status</th><th>Action</th></tr></thead>
+        <tbody><tr><td colspan="6" class="muted">Loading…</td></tr></tbody>
+      </table></div>
+    </div>
   </section>
 
   <!-- LOGS -->
@@ -563,6 +582,15 @@
       <div class="card glass"><h2>Configuration</h2><div id="config-box" class="kv"></div></div>
       <div class="card glass"><h2>TLS certificate</h2><div id="cert-box" class="kv"></div>
         <h2 style="margin-top:1.2rem">Debug switches</h2><div id="switches-box" class="kv"></div></div>
+    </div>
+    <div class="card glass">
+      <div class="row-between"><h2>Live gameplay config</h2>
+      <button id="configkeys-save" class="btn primary">Save (restart services to apply)</button></div>
+      <p class="hint">Curated safe knobs in <code>run/secrets.env</code> — everything else stays in the Setup tab's raw editor. Saving notes the change in the audit log.</p>
+      <div class="table-wrap"><table id="configkeys-table">
+        <thead><tr><th>Key</th><th>Value</th><th>Default</th><th>What it does</th></tr></thead>
+        <tbody><tr><td colspan="4" class="muted">Loading…</td></tr></tbody>
+      </table></div>
     </div>
   </section>
 </main>

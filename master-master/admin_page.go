@@ -70,6 +70,9 @@ const masterAdminPageHTML = `<!doctype html>
   <div class="msg" id="loginmsg"></div>
 </div></div>
 <div class="msg" id="msg"></div>
+<h2>Cluster comparison</h2>
+<p class="note">Same settings side by side: rows are attributes, columns are clusters.</p>
+<div class="table-wrap"><table id="compare-table"></table></div>
 <h2>Manual sync</h2>
 <p class="note">Trigger a push/pull cycle on the clusters right now instead of waiting for the
   next interval. <b>Roll out</b> copies the main cluster everywhere (forced): the main cluster
@@ -295,6 +298,16 @@ const masterAdminPageHTML = `<!doctype html>
             load();
           } catch (e) { say(String(e && e.message || e), true); }
         });
+        mk('Pair…', false, async () => {
+          if (!confirm('Mint a one-time pairing token for "' + c.name + '"? Anyone holding it can claim this cluster identity within 24h.')) return;
+          try {
+            const r = await call('POST', '/admin/api/clusters/' + c.id + '/pair');
+            $('secretText').textContent = r.token;
+            $('secretSent').textContent = 'One-time token (24h, single use). Paste it ONCE as PAIRING_TOKEN (env) or into run/pairing.env on the cluster host — the agent exchanges it for the secret by itself, then it burns.';
+            $('secretDlg').showModal();
+            load();
+          } catch (e) { say(String(e && e.message || e), true); }
+        });
         if (c.blocked) mk('Unblock', false, async () => {
           try { await call('POST', '/admin/api/clusters/' + c.id + '/unblock'); say('Unblocked; returns on next heartbeat.'); load(); }
           catch (e) { say(String(e && e.message || e), true); }
@@ -347,6 +360,38 @@ const masterAdminPageHTML = `<!doctype html>
     loadSyncLog();
   }
   function saySync2(t, bad) { $('syncmsg2').textContent = t; $('syncmsg2').className = 'msg ' + (bad ? 'bad' : 'good'); }
+  function renderCompare(clusters, syncrows) {
+    const tbl = $('compare-table');
+    const syncByID = {};
+    for (const s of (syncrows || [])) syncByID[s.id] = s;
+    const rows = [
+      ['Status', (c) => c.blocked ? 'blocked' : (c.status || '–')],
+      ['Version', (c) => c.version || '–'],
+      ['Players', (c) => c.players],
+      ['Servers', (c) => c.servers],
+      ['Address', (c) => (c.web_url || '') + ' / ' + (c.battle_ip || '')],
+      ['MOTD', (c) => (c.motd || '–') + (c.motd_until ? ' (until ' + c.motd_until + ')' : '')],
+      ['Note', (c) => c.note || '–'],
+      ['Secret', (c) => c.has_secret ? 'set' : 'none'],
+      ['Agent', (c) => (syncByID[c.id] && syncByID[c.id].agent_url) || c.agent_url || '–'],
+      ['Last push', (c) => (syncByID[c.id] && syncByID[c.id].last_push) || '–'],
+      ['Last pull', (c) => (syncByID[c.id] && syncByID[c.id].last_pull) || '–'],
+      ['Mirrored accounts', (c) => c.mirrored_users],
+      ['Last heartbeat', (c) => c.last_heartbeat || '–'],
+    ];
+    let html = '<thead><tr><th></th>';
+    for (const c of (clusters || [])) html += '<th>' + c.name + '</th>';
+    html += '</tr></thead><tbody>';
+    for (const [label, fn] of rows) {
+      html += '<tr><td><b>' + label + '</b></td>';
+      for (const c of (clusters || [])) {
+        const v = fn(c);
+        html += '<td>' + String(v == null ? '–' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;') + '</td>';
+      }
+      html += '</tr>';
+    }
+    tbl.innerHTML = html + '</tbody>';
+  }
   async function loadSyncStatus() {
     try {
       const d = await call('GET', '/admin/api/syncstatus');
@@ -404,6 +449,7 @@ const masterAdminPageHTML = `<!doctype html>
         tb.append(tr);
       }
       if (!tb.children.length) tb.innerHTML = '<tr><td colspan="7">No clusters registered yet.</td></tr>';
+      renderCompare(lastClusters, d.clusters);
     } catch (e) { saySync2(String(e && e.message || e), true); }
   }
   async function loadPresence() {

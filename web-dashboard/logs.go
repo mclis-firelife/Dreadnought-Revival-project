@@ -61,6 +61,7 @@ func (s *server) logSources() map[string]string {
 		"mmogbrain":     find("mmogbrain.log"),
 		"mmog-frames":   frame,
 		"web-dashboard": find("web-dashboard.log"),
+		"sync-agent":    find("sync-agent.log"),
 	}
 }
 

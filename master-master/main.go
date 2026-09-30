@@ -122,6 +122,12 @@ func newAPIRouter(h *handlers.Handler, log *logrus.Logger) http.Handler {
 	// key for the whole mesh.
 	r.HandleFunc("/sync/push", h.SyncPush).Methods(http.MethodPost)
 	r.HandleFunc("/sync/pull", h.SyncPull).Methods(http.MethodGet)
+	// One-time pairing exchange + secret self-rotation (see handlers).
+	r.HandleFunc("/sync/pair", h.SyncPair).Methods(http.MethodPost)
+	r.HandleFunc("/sync/rotate", h.SyncRotate).Methods(http.MethodPost)
+	// Single sign-on across clusters (opaque roaming tickets).
+	r.HandleFunc("/roam/delegate", h.SyncRoamDelegate).Methods(http.MethodPost)
+	r.HandleFunc("/roam/verify", h.SyncRoamVerify).Methods(http.MethodPost)
 	// Launcher presence check: public (see SyncPresence for the reasoning).
 	r.HandleFunc("/presence/{user_id}", h.SyncPresence).Methods(http.MethodGet)
 	// Launcher registration pre-check: public (see SyncRegisterCheck).
@@ -168,6 +174,7 @@ func newAdminRouter(h *handlers.Handler, password string, log *logrus.Logger) ht
 	admin.HandleFunc("/api/motd-all", h.AdminMotdAll).Methods(http.MethodPost)
 	admin.HandleFunc("/api/clusters/{id}/ping", h.AdminPingAgent).Methods(http.MethodPost)
 	admin.HandleFunc("/api/clusters/{id}/note", h.AdminSetNote).Methods(http.MethodPost)
+	admin.HandleFunc("/api/clusters/{id}/pair", h.AdminPair).Methods(http.MethodPost)
 	return r
 }
 

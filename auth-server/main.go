@@ -64,6 +64,11 @@ func main() {
 	r.Handle("/auth/register", loginLimiter.Middleware(http.HandlerFunc(h.Register))).Methods(http.MethodPost)
 	r.HandleFunc("/auth/me", jwtMiddleware(secret, database, h.Me)).Methods(http.MethodGet)
 	r.HandleFunc("/auth/logout", h.Logout).Methods(http.MethodPost)
+	// Cross-cluster single sign-on: grant mints a roaming ticket for the
+	// logged-in user (JWT-authed), redeem trades a ticket from elsewhere
+	// for a local session (rate-limited like password login).
+	r.HandleFunc("/auth/roam/grant", jwtMiddleware(secret, database, h.RoamGrant)).Methods(http.MethodPost)
+	r.Handle("/auth/roam/redeem", loginLimiter.Middleware(http.HandlerFunc(h.RoamRedeem))).Methods(http.MethodPost)
 	r.HandleFunc("/health", h.Health).Methods(http.MethodGet)
 	r.Handle("/metrics", promhttp.Handler())
 

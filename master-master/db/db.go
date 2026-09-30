@@ -110,6 +110,30 @@ var migrations = []string{
 	`ALTER TABLE clusters ADD COLUMN secret_set_at TEXT NOT NULL DEFAULT ''`,
 	// MOTD expiry: empty means permanent (the old behaviour).
 	`ALTER TABLE clusters ADD COLUMN motd_until TEXT NOT NULL DEFAULT ''`,
+	// One-time pairing tokens: the operator generates one per cluster (shown
+	// once), the cluster operator pastes it exactly once, the agent
+	// exchanges it for the cluster secret. Burned on use, expired after a
+	// day. After pairing, rotation is authenticated by the secret itself.
+	`CREATE TABLE IF NOT EXISTS pairing_tokens (
+		token_hash TEXT PRIMARY KEY,
+		cluster_id TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL DEFAULT (datetime('now')),
+		expires_at TEXT NOT NULL DEFAULT (datetime('now','+1 day')),
+		used_at    TEXT NOT NULL DEFAULT ''
+	)`,
+	// Roaming tickets (single sign-on): a cluster asks for one on behalf of
+	// its logged-in user (delegate, authed by cluster secret); another
+	// cluster redeems it for a local session (verify, authed by its own
+	// secret). Opaque random, 5 minutes, reusable within expiry (one user
+	// may roam to several clusters), pruned by the sweeper.
+	`CREATE TABLE IF NOT EXISTS roam_tickets (
+		token_hash TEXT PRIMARY KEY,
+		user_id    TEXT NOT NULL DEFAULT '',
+		username   TEXT NOT NULL DEFAULT '',
+		email      TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL DEFAULT (datetime('now')),
+		expires_at TEXT NOT NULL DEFAULT (datetime('now','+5 minutes'))
+	)`,
 }
 
 func Open(path string) (*sql.DB, error) {

@@ -274,6 +274,13 @@ func loginAccount(authURL, identifier, password string) (storedCredentials, erro
 	if resp.StatusCode >= 400 {
 		return storedCredentials{}, fmt.Errorf("%s", serverMessage(payload, "incorrect email or password"))
 	}
+	return parseLoginPayload(payload, identifier)
+}
+
+// parseLoginPayload reads a sign-in shaped response (plain or JSON-RPC
+// enveloped) into stored credentials. Shared by password login and roam
+// redeem so both accept exactly the same server shapes.
+func parseLoginPayload(payload []byte, identifier string) (storedCredentials, error) {
 	var user userObj
 	if err := json.Unmarshal(payload, &user); err != nil {
 		return storedCredentials{}, fmt.Errorf("could not read the sign-in response: %w", err)
@@ -321,4 +328,54 @@ func browserTokenExpired(token string) bool {
 		return true
 	}
 	return time.Now().Add(skew).After(time.Unix(claims.Exp, 0))
+}
+
+// roamGrant asks the signed-in cluster for a roaming ticket to take
+// elsewhere (Authorization: the cluster JWT). The ticket is short-lived;
+// the browser redeems it immediately and never stores it.
+func roamGrant(authURL, token string) (ticket, username string, err error) {
+	endpoint := strings.TrimSuffix(strings.TrimSpace(authURL), "/") + "/roam/grant"
+	req, err := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(`{}`))
+	if err != nil {
+		return "", "", fmt.Errorf("contact %s: %w", endpoint, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := browserHTTPClient().Do(req)
+	if err != nil {
+		return "", "", fmt.Errorf("contact %s: %w", endpoint, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	payload, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	if resp.StatusCode != http.StatusOK {
+		return "", "", fmt.Errorf("%s", serverMessage(payload, "roaming not available here"))
+	}
+	var doc struct {
+		Ticket   string `json:"ticket"`
+		Username string `json:"username"`
+	}
+	if err := json.Unmarshal(payload, &doc); err != nil || len(doc.Ticket) < 16 {
+		return "", "", fmt.Errorf("the server did not return a roaming ticket")
+	}
+	return doc.Ticket, doc.Username, nil
+}
+
+// roamRedeem trades a roaming ticket for a normal session on the selected
+// cluster. The answer parses like a password login (same shapes accepted).
+func roamRedeem(authURL, ticket, identifier string) (storedCredentials, error) {
+	body, err := json.Marshal(map[string]string{"ticket": ticket})
+	if err != nil {
+		return storedCredentials{}, fmt.Errorf("marshal roaming ticket: %w", err)
+	}
+	endpoint := strings.TrimSuffix(strings.TrimSpace(authURL), "/") + "/roam/redeem"
+	resp, err := browserHTTPClient().Post(endpoint, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return storedCredentials{}, fmt.Errorf("contact %s: %w", endpoint, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	payload, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 400 {
+		return storedCredentials{}, fmt.Errorf("%s", serverMessage(payload, "roaming sign-in failed"))
+	}
+	return parseLoginPayload(payload, identifier)
 }

@@ -585,3 +585,106 @@ func TestHandleSyncNow(t *testing.T) {
 		t.Fatalf("forced run: got %d (%v), want applied=1 forced=true", code, doc)
 	}
 }
+
+func TestPairExchangeStoresSecret(t *testing.T) {
+	master := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/sync/pair" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		var req struct {
+			Token string `json:"token"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Token != "pair-token-abc" {
+			http.Error(w, `{"error":"unknown token"}`, http.StatusForbidden)
+			return
+		}
+		_, _ = w.Write([]byte(`{"status":"paired","secret":"0123456789abcdef0123456789abcdef"}`))
+	}))
+	defer master.Close()
+	dir := t.TempDir()
+	secretFile := filepath.Join(dir, "sync.env")
+	pairingFile := filepath.Join(dir, "pairing.env")
+	if err := os.WriteFile(pairingFile, []byte("PAIRING_TOKEN=pair-token-abc\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := &agent{
+		cfg: config{masterURL: master.URL, secretFile: secretFile, pairingFile: pairingFile},
+		log: testLogger(t), http: master.Client(),
+	}
+	a.tryPair()
+	raw, err := os.ReadFile(secretFile)
+	if err != nil || strings.TrimSpace(string(raw)) != "SYNC_SECRET=0123456789abcdef0123456789abcdef" {
+		t.Fatalf("secret not stored: %q (err %v)", string(raw), err)
+	}
+	if _, err := os.Stat(pairingFile); !os.IsNotExist(err) {
+		t.Fatal("pairing file must be removed after success")
+	}
+	// No token configured: no-op, no secret file.
+	a2 := &agent{
+		cfg: config{masterURL: master.URL, secretFile: filepath.Join(dir, "other.env")},
+		log: testLogger(t), http: master.Client(),
+	}
+	a2.tryPair()
+	if _, err := os.Stat(filepath.Join(dir, "other.env")); !os.IsNotExist(err) {
+		t.Fatal("no pairing token must mean no secret file")
+	}
+}
+
+func TestAutoRotate(t *testing.T) {
+	rotated := 0
+	master := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/sync/rotate" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.Header.Get("X-Sync-Key") != "old-secret-0123456789abcdef" {
+			http.Error(w, `{"error":"bad key"}`, http.StatusForbidden)
+			return
+		}
+		rotated++
+		_, _ = w.Write([]byte(`{"status":"rotated","secret":"new-secret-abcdef0123456789"}`))
+	}))
+	defer master.Close()
+	dir := t.TempDir()
+	secretFile := filepath.Join(dir, "sync.env")
+	mk := func(days int) (*agent, syncState) {
+		st := syncState{Users: map[string]string{}}
+		if days >= 0 {
+			st.RotatedAt = time.Now().UTC().AddDate(0, 0, -days).Format(time.RFC3339)
+		}
+		return &agent{
+			cfg: config{masterURL: master.URL, secretFile: secretFile, rotateDays: 30},
+			log: testLogger(t), http: master.Client(),
+		}, st
+	}
+	// Fresh secret (never rotated): clock starts, no call.
+	a, st := mk(-1)
+	if got := a.maybeRotate("old-secret-0123456789abcdef", &st); got != "old-secret-0123456789abcdef" || rotated != 0 {
+		t.Fatalf("fresh secret must not rotate: %q calls=%d", got, rotated)
+	}
+	if st.RotatedAt == "" {
+		t.Fatal("first sight must stamp the clock")
+	}
+	// Recent rotation: no call.
+	a, st = mk(5)
+	if got := a.maybeRotate("old-secret-0123456789abcdef", &st); got != "old-secret-0123456789abcdef" || rotated != 0 {
+		t.Fatalf("recent rotation must not re-rotate: %q calls=%d", got, rotated)
+	}
+	// Due rotation: new secret stored + clock refreshed.
+	a, st = mk(31)
+	if got := a.maybeRotate("old-secret-0123456789abcdef", &st); got != "new-secret-abcdef0123456789" || rotated != 1 {
+		t.Fatalf("due rotation: got %q calls=%d", got, rotated)
+	}
+	raw, _ := os.ReadFile(secretFile)
+	if !strings.Contains(string(raw), "new-secret-abcdef0123456789") {
+		t.Fatalf("rotated secret not on disk: %q", string(raw))
+	}
+	// Disabled: never calls.
+	a.cfg.rotateDays = 0
+	st.RotatedAt = time.Now().UTC().AddDate(0, 0, -365).Format(time.RFC3339)
+	if got := a.maybeRotate("old-secret-0123456789abcdef", &st); got != "old-secret-0123456789abcdef" || rotated != 1 {
+		t.Fatalf("disabled rotation must not call: %q calls=%d", got, rotated)
+	}
+}

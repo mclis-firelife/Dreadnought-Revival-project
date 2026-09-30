@@ -7,12 +7,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/sirupsen/logrus"
 )
 
 // Service control + first-run setup from the dashboard UI.
@@ -275,6 +277,8 @@ func (s *server) apiSetupLog(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"lines": lines, "truncated": truncated, "running": job})
 }
 
+// ---------------------------------------------------------------- secrets editor
+
 // apiSecretsGet returns run/secrets.env verbatim (or "" when absent — the
 // editor then starts from the shipped example template).
 func (s *server) apiSecretsGet(w http.ResponseWriter, _ *http.Request) {
@@ -315,4 +319,366 @@ func (s *server) apiSecretsSet(w http.ResponseWriter, r *http.Request) {
 	s.log.Warn("dashboard wrote run/secrets.env (services pick it up on (re)start; the dashboard keeps its startup key)")
 	s.audit("secrets-write", "run/secrets.env")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "saved"})
+}
+
+// ---------------------------------------------------------------- live config keys
+
+// configKeys is the curated whitelist for the Config tab editor: safe
+// gameplay knobs an operator may change without breaking the install.
+// Secrets, paths, URLs and ports stay in the raw editor above. Every key
+// takes effect on service (re)start — the UI says so next to Save.
+type configKey struct {
+	Key     string `json:"key"`
+	Desc    string `json:"desc"`
+	Default string `json:"default"`
+	Value   string `json:"value"`
+}
+
+var editableConfigKeys = []struct{ key, desc, def string }{
+	{"PLAYERS_PER_MATCH", "Queued players per match (1 = private matches for testing)", "1"},
+	{"DN_MATCH_AUTOSCALE", "Size matches by online players (1) or fixed count (0)", "1"},
+	{"DN_MATCH_MAX_PLAYERS", "Largest auto-scaled match", "10"},
+	{"DN_MATCH_MAX_WAIT", "Wait for idle players after first queue (e.g. 60s)", "60s"},
+	{"DN_REWARD_WIN_CREDITS", "Credits per win (placeholders, originals lost)", "1500"},
+	{"DN_REWARD_LOSS_CREDITS", "Credits per loss", "750"},
+	{"DN_REWARD_KILL_CREDITS", "Credits per kill", "100"},
+	{"DN_REWARD_WIN_XP", "XP per win", "1000"},
+	{"DN_REWARD_LOSS_XP", "XP per loss", "500"},
+	{"DN_REWARD_KILL_XP", "XP per kill", "50"},
+	{"DN_TECHTREE_LIMIT", "Tech tree items per manufacturer group (bisect aid)", ""},
+	{"DN_NO_DEFER_PLAYER_FLEETS", "Answer fleet requests immediately (1, reproduces a client bug)", ""},
+	{"DN_ALLOW_MOCK_INSTANCES", "Allow mock battle instances (testing)", ""},
+	{"SYNC_INTERVAL", "Roaming push/pull cadence (min 10s)", "60s"},
+	{"SYNC_ROTATE_DAYS", "Secret self-rotation days (0 disables)", "30"},
+	{"CLUSTER_MOTD", "Message of the day shown in the browser", ""},
+	{"CLUSTER_VERSION", "Version shown in the browser", "1.0"},
+}
+
+// secretsValues parses KEY=VALUE lines (skips blanks/comments, first wins).
+func secretsValues(content string) map[string]string {
+	out := map[string]string{}
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		k = strings.TrimSpace(k)
+		if _, seen := out[k]; !seen {
+			out[k] = strings.TrimSpace(v)
+		}
+	}
+	return out
+}
+
+func (s *server) secretsContent() string {
+	raw, err := os.ReadFile(filepath.Join(s.repoRoot(), "run", "secrets.env"))
+	if err != nil {
+		return ""
+	}
+	return string(raw)
+}
+
+func (s *server) apiConfigKeys(w http.ResponseWriter, _ *http.Request) {
+	vals := secretsValues(s.secretsContent())
+	out := make([]configKey, 0, len(editableConfigKeys))
+	for _, k := range editableConfigKeys {
+		out = append(out, configKey{Key: k.key, Desc: k.desc, Default: k.def, Value: vals[k.key]})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"keys": out})
+}
+
+func (s *server) apiSetConfigKeys(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Values map[string]string `json:"values"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	allowed := map[string]bool{}
+	for _, k := range editableConfigKeys {
+		allowed[k.key] = true
+	}
+	changed := []string{}
+	for k := range req.Values {
+		if !allowed[k] {
+			writeError(w, http.StatusBadRequest, "not editable here: "+k)
+			return
+		}
+		changed = append(changed, k)
+	}
+	if len(changed) == 0 {
+		writeError(w, http.StatusBadRequest, "nothing to save")
+		return
+	}
+	sort.Strings(changed)
+	// Merge line-wise: replace existing KEY= lines, append the rest at the
+	// end. Comments, order and unknown keys survive untouched.
+	lines := strings.Split(s.secretsContent(), "\n")
+	seen := map[string]bool{}
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if k, _, ok := strings.Cut(trimmed, "="); ok {
+			k = strings.TrimSpace(k)
+			if v, ok := req.Values[k]; ok {
+				lines[i] = k + "=" + strings.TrimSpace(strings.ReplaceAll(v, "\n", " "))
+				seen[k] = true
+			}
+		}
+	}
+	for _, k := range changed {
+		if !seen[k] {
+			lines = append(lines, k+"="+strings.TrimSpace(strings.ReplaceAll(req.Values[k], "\n", " ")))
+		}
+	}
+	content := strings.Join(lines, "\n")
+	if !strings.HasSuffix(content, "\n") {
+		content += "\n"
+	}
+	path := filepath.Join(s.repoRoot(), "run", "secrets.env")
+	if err := os.MkdirAll(filepath.Join(s.repoRoot(), "run"), 0o700); err != nil {
+		writeError(w, http.StatusInternalServerError, "cannot create run dir")
+		return
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		writeError(w, http.StatusInternalServerError, "cannot write secrets.env")
+		return
+	}
+	sort.Strings(changed)
+	s.log.WithField("keys", strings.Join(changed, ",")).Warn("dashboard edited live config keys (restart services to apply)")
+	s.audit("config-keys", strings.Join(changed, ","))
+	writeJSON(w, http.StatusOK, map[string]any{"status": "saved", "keys": changed,
+		"note": "restart services (Setup tab) to apply"})
+}
+
+// ---------------------------------------------------------------- player history
+
+// apiPlayerHistory collects audit entries mentioning one account (grants,
+// bans, resets, provisions): the operator paper trail per player. Matches
+// both id spellings.
+func (s *server) apiPlayerHistory(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "id required")
+		return
+	}
+	folded := normJoinID(id)
+	lines, _, err := tailFile(s.auditPath(), 5000)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"entries": []any{}})
+		return
+	}
+	type entry struct {
+		Time   string `json:"time"`
+		Action string `json:"action"`
+		Detail string `json:"detail"`
+	}
+	out := []entry{}
+	for _, line := range lines {
+		var e entry
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			continue
+		}
+		hay := normJoinID(e.Detail)
+		if !strings.Contains(line, id) && !strings.Contains(hay, folded) {
+			continue
+		}
+		out = append(out, e)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"entries": out, "count": len(out)})
+}
+
+// ---------------------------------------------------------------- scheduled events
+
+// scheduledItem is one future operator action: a launcher tile upsert (or
+// delete) or a chat broadcast, executed by the dashboard's minute ticker.
+type scheduledItem struct {
+	ID      string `json:"id"`
+	At      string `json:"at"`
+	Kind    string `json:"kind"`
+	Title   string `json:"title"`
+	Body    string `json:"body"`
+	Channel string `json:"channel"`
+	TileID  string `json:"tile_id"`
+	Done    string `json:"done"`
+}
+
+func (s *server) scheduledPath() string {
+	return filepath.Join(s.cfg.runDir, "web-dashboard-scheduled.json")
+}
+
+func (s *server) readScheduled() []scheduledItem {
+	out := []scheduledItem{}
+	raw, err := os.ReadFile(s.scheduledPath())
+	if err != nil {
+		return out
+	}
+	_ = json.Unmarshal(raw, &out)
+	return out
+}
+
+func (s *server) writeScheduled(items []scheduledItem) error {
+	raw, _ := json.MarshalIndent(items, "", "  ")
+	return os.WriteFile(s.scheduledPath(), raw, 0o600)
+}
+
+func (s *server) apiScheduled(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		items := s.readScheduled()
+		writeJSON(w, http.StatusOK, map[string]any{"items": items, "count": len(items)})
+	case http.MethodPost:
+		var req struct {
+			At      string `json:"at"`
+			Kind    string `json:"kind"`
+			Title   string `json:"title"`
+			Body    string `json:"body"`
+			Channel string `json:"channel"`
+			TileID  string `json:"tile_id"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid body")
+			return
+		}
+		at, err := time.Parse(time.RFC3339, strings.TrimSpace(req.At))
+		if err != nil || !at.After(time.Now().Add(-time.Minute)) {
+			writeError(w, http.StatusBadRequest, "at must be a future RFC3339 time")
+			return
+		}
+		req.Kind = strings.TrimSpace(req.Kind)
+		if req.Kind != "tile" && req.Kind != "tile-delete" && req.Kind != "broadcast" {
+			writeError(w, http.StatusBadRequest, "kind must be tile, tile-delete or broadcast")
+			return
+		}
+		if len([]rune(req.Title)) > 120 || len([]rune(req.Body)) > 2000 {
+			writeError(w, http.StatusBadRequest, "title/body too long")
+			return
+		}
+		if (req.Kind == "tile" || req.Kind == "tile-delete") && strings.TrimSpace(req.TileID) == "" {
+			writeError(w, http.StatusBadRequest, "tile_id required for tile actions")
+			return
+		}
+		if (req.Kind == "tile" || req.Kind == "broadcast") && strings.TrimSpace(req.Body) == "" {
+			writeError(w, http.StatusBadRequest, "body required for tile/broadcast")
+			return
+		}
+		items := s.readScheduled()
+		id := fmt.Sprintf("%d", time.Now().UTC().UnixNano())
+		items = append(items, scheduledItem{
+			ID: id, At: at.UTC().Format(time.RFC3339), Kind: req.Kind,
+			Title: strings.TrimSpace(req.Title), Body: req.Body,
+			Channel: strings.TrimSpace(req.Channel), TileID: strings.TrimSpace(req.TileID),
+		})
+		if err := s.writeScheduled(items); err != nil {
+			writeError(w, http.StatusInternalServerError, "cannot store schedule")
+			return
+		}
+		s.audit("schedule-add", req.Kind+" @ "+at.UTC().Format(time.RFC3339))
+		writeJSON(w, http.StatusOK, map[string]any{"status": "scheduled", "id": id})
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (s *server) apiDeleteScheduled(w http.ResponseWriter, r *http.Request) {
+	id := mux.Vars(r)["id"]
+	if strings.TrimSpace(id) == "" || strings.ContainsAny(id, "/\\. ") {
+		writeError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+	kept := []scheduledItem{}
+	found := false
+	for _, it := range s.readScheduled() {
+		if it.ID == id {
+			found = true
+			continue
+		}
+		kept = append(kept, it)
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if err := s.writeScheduled(kept); err != nil {
+		writeError(w, http.StatusInternalServerError, "cannot store schedule")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// startScheduler runs due items every minute: tiles upserted/deleted via the
+// same upstream calls as the manual buttons, broadcasts sent as operator.
+func (s *server) startScheduler() {
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			s.runDueScheduled()
+		}
+	}()
+}
+
+func (s *server) runDueScheduled() {
+	now := time.Now().UTC()
+	items := s.readScheduled()
+	changed := false
+	for i := range items {
+		it := &items[i]
+		if it.Done != "" {
+			continue
+		}
+		at, err := time.Parse(time.RFC3339, it.At)
+		if err != nil || at.After(now) {
+			continue
+		}
+		var runErr string
+		switch it.Kind {
+		case "tile":
+			code, _ := s.upstreamPostJSON(s.cfg.legacyURL, "/admin/tiles", s.cfg.adminKey, map[string]any{
+				"id": it.TileID, "type": "announcement", "section_size": "full",
+				"title": it.Title, "body": it.Body, "active": true,
+			})
+			if code != http.StatusOK && code != http.StatusCreated {
+				runErr = fmt.Sprintf("HTTP %d", code)
+			}
+		case "tile-delete":
+			code, _ := s.upstreamDelete(s.cfg.legacyURL, "/admin/tiles/"+it.TileID, s.cfg.adminKey)
+			if code != http.StatusOK && code != http.StatusNotFound {
+				runErr = fmt.Sprintf("HTTP %d", code)
+			}
+		case "broadcast":
+			channel := it.Channel
+			if channel == "" {
+				channel = "dreadnought.global"
+			}
+			code, _ := s.upstreamPostJSON(s.cfg.mmogURL, "/admin/broadcast", s.cfg.adminKey, map[string]string{
+				"channel": channel, "content": it.Body,
+			})
+			if code != http.StatusOK {
+				runErr = fmt.Sprintf("HTTP %d", code)
+			}
+		}
+		if runErr != "" {
+			s.log.WithFields(logrus.Fields{"id": it.ID, "error": runErr}).Warn("scheduled item failed (kept for retry)")
+			continue
+		}
+		it.Done = now.Format(time.RFC3339)
+		changed = true
+		s.log.WithField("id", it.ID).Info("scheduled item executed")
+		s.audit("schedule-run", it.Kind+" "+it.Title)
+	}
+	if changed {
+		// Keep executed items visible (done timestamp) but cap the file.
+		if len(items) > 200 {
+			items = items[len(items)-200:]
+		}
+		_ = s.writeScheduled(items)
+	}
 }

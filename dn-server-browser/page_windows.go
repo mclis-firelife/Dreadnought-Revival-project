@@ -275,7 +275,23 @@ const browserPageHTML = `<!doctype html>
   }
   function afterCert(r) {
     if (r && r.signedIn) home(r.username);
-    else { pick('login'); show('signin'); }
+    else { pick('login'); show('signin'); tryRoam(); }
+  }
+  // Single sign-on: signed in on cluster A, joining cluster B reuses that
+  // sign-in through a roaming ticket — no password typed twice. Falls back
+  // to the form below when no other cluster vouches.
+  function tryRoam() {
+    say('msg', 'Checking other servers for your sign-in…');
+    dnRoam();
+  }
+  function dnRoamResult(r) {
+    if (r && r.ok) {
+      say('msg', '', '');
+      $('password').value = '';
+      home(r.username);
+      return;
+    }
+    say('msg', '');
   }
   async function addManual() {
     $('m-go').disabled = true;

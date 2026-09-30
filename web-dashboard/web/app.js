@@ -69,13 +69,13 @@ function switchTab(name) {
   if (name === "market") loadCatalog();
   if (name === "audit") loadAudit();
   if (name === "online") loadOnline();
-  if (name === "news") loadTiles();
+  if (name === "news") { loadTiles(); loadScheduled(); }
   if (name === "backups") loadBackups();
   if (name === "servers") loadServers();
   if (name === "chat") loadChat();
   if (name === "logs") initLogs();
   if (name === "metrics") loadMetrics();
-  if (name === "config") loadConfig();
+  if (name === "config") { loadConfig(); loadConfigKeys(); }
   if (name === "reports") loadReports();
   if (name === "setup") { loadSetup(); loadSecrets(); }
   if (name === "overview") { loadStatus(); loadSeries(); loadTopKillers(); loadEconomyAndSessions(); }
@@ -934,12 +934,26 @@ async function showPlayerDetail(pid, name) {
     <p><b>Fleets:</b><br>${fleetRows}</p>
     <p><b>Ships (top 12 by XP):</b><br>${shipRows}</p>
     <p><b>Recent results:</b><br>${resRows}</p>
-    <div id="player-progress"><p class="muted">Loading career …</p></div>`;
+    <div id="player-progress"><p class="muted">Loading career …</p></div>
+    <div id="player-history"><p class="muted">Loading operator history …</p></div>`;
     showPlayerProgress(pid).then((html) => {
       const el = $("player-progress");
       if (el) el.innerHTML = html;
     });
+    loadPlayerHistory(pid);
   } catch (e) { box.innerHTML = `<p class="error">${esc(e.message)}</p>`; }
+}
+
+async function loadPlayerHistory(pid) {
+  try {
+    const data = await api("/api/player-history?id=" + encodeURIComponent(pid));
+    const list = data.entries || [];
+    const el = $("player-history");
+    if (!el) return;
+    el.innerHTML = "<p><b>Operator history:</b><br>" + (list.map((e) =>
+      `${esc(e.time)} — <code>${esc(e.action)}</code> ${esc(e.detail)}`).join("<br>") ||
+      "No operator actions recorded for this account.") + "</p>";
+  } catch (e) { /* history is garnish */ }
 }
 
 /* ---------- queue actions ---------- */
@@ -1610,6 +1624,65 @@ async function saveSecrets() {
   } catch (e) { toast(e.message, "err"); }
 }
 
+/* ---------- live config keys + scheduled events ---------- */
+async function loadConfigKeys() {
+  try {
+    const data = await api("/api/config-keys");
+    const tb = tbodyFor("configkeys-table");
+    tb.innerHTML = "";
+    for (const k of (data.keys || [])) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td><code></code></td><td></td><td class="muted"></td><td class="muted-sm"></td>`;
+      const t = tr.children;
+      t[0].querySelector("code").textContent = k.key;
+      const input = document.createElement("input");
+      input.value = k.value || "";
+      input.placeholder = k.default || "(unset)";
+      input.dataset.key = k.key;
+      t[1].appendChild(input);
+      t[2].textContent = k.default || "–";
+      t[3].textContent = k.desc || "";
+      tb.appendChild(tr);
+    }
+  } catch (e) { toast("Config keys: " + e.message, "err"); }
+}
+
+async function saveConfigKeys() {
+  const values = {};
+  document.querySelectorAll("#configkeys-table input").forEach((i) => { values[i.dataset.key] = i.value; });
+  confirmAction("Save gameplay config?", "Writes run/secrets.env (comments preserved). Restart services to apply.", async () => {
+    const data = await api("/api/config-keys", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ values }),
+    });
+    toast(`Saved ${data.keys.length} key(s) — restart services to apply.`, "ok");
+  });
+}
+
+async function loadScheduled() {
+  try {
+    const data = await api("/api/scheduled");
+    const tb = tbodyFor("sched-table");
+    tb.innerHTML = "";
+    for (const it of (data.items || [])) {
+      const tr = document.createElement("tr");
+      const done = it.done ? `done ${esc(it.done)}` : '<span class="badge ok">pending</span>';
+      tr.innerHTML = `<td>${esc(it.at)}</td><td><code>${esc(it.kind)}</code></td><td>${esc(it.title)}</td>
+        <td>${esc(it.kind === "broadcast" ? it.channel : it.tile_id)}</td><td>${done}</td><td></td>`;
+      const del = document.createElement("button");
+      del.className = "btn small danger";
+      del.textContent = "✕";
+      del.onclick = async () => {
+        await api("/api/scheduled/" + encodeURIComponent(it.id), { method: "DELETE" }).catch((e) => toast(e.message, "err"));
+        loadScheduled();
+      };
+      tr.lastChild.appendChild(del);
+      tb.appendChild(tr);
+    }
+    if (!(data.items || []).length) tb.innerHTML = '<tr><td colspan="6" class="muted">Nothing scheduled.</td></tr>';
+  } catch (e) { toast("Schedule: " + e.message, "err"); }
+}
+
 /* ---------- polling ---------- */
 async function refreshAll() {
   try { await api("/api/me"); hideLogin(); } catch { showLogin(); return; }
@@ -1671,6 +1744,27 @@ document.addEventListener("DOMContentLoaded", () => {
   $("servers-reload").onclick = loadServers;
   $("chat-reload").onclick = loadChat;
   $("metrics-reload").onclick = loadMetrics;
+  $("configkeys-save").onclick = saveConfigKeys;
+  $("sched-reload").onclick = loadScheduled;
+  $("sched-add").onclick = async () => {
+    const at = ($("sched-at").value || "").trim();
+    const kind = $("sched-kind").value;
+    const payload = {
+      at, kind,
+      title: $("sched-title").value.trim(),
+      body: $("sched-body").value,
+      channel: $("sched-target").value.trim(),
+      tile_id: $("sched-target").value.trim(),
+    };
+    if (!at) { toast("Pick a start time first.", "err"); return; }
+    try {
+      await api("/api/scheduled", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+      });
+      toast("Scheduled.", "ok");
+      loadScheduled();
+    } catch (e) { toast(e.message, "err"); }
+  };
   $("setup-reload").onclick = loadSetup;
   $("svc-start-all").onclick = () => runJob("/api/services/start-all", "Start all");
   $("svc-stop-all").onclick = () => confirmAction("Stop ALL services?", "The whole stack (not this dashboard) goes down.", () => runJob("/api/services/stop-all", "Stop all"));

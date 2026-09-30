@@ -1263,6 +1263,192 @@ func (h *Handler) AdminDuplicates(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"groups": out, "count": len(out)})
 }
 
+// AdminPair handles POST /admin/api/clusters/{id}/pair — mint a one-time
+// pairing token for a cluster (shown ONCE, like a secret). The cluster
+// operator pastes it exactly once (PAIRING_TOKEN env or run/pairing.env);
+// the agent exchanges it for the cluster secret, no mail round-trip.
+// Expires after 24h, burns on first use.
+func (h *Handler) AdminPair(w http.ResponseWriter, r *http.Request) {
+	id := mux.Vars(r)["id"]
+	var name string
+	if err := h.DB.QueryRow(`SELECT name FROM clusters WHERE id=?`, id).Scan(&name); err != nil {
+		writeError(w, http.StatusNotFound, "cluster not found")
+		return
+	}
+	raw := make([]byte, 24)
+	if _, err := rand.Read(raw); err != nil {
+		writeError(w, http.StatusInternalServerError, "cannot generate token")
+		return
+	}
+	token := hex.EncodeToString(raw)
+	if _, err := h.DB.Exec(`INSERT INTO pairing_tokens(token_hash,cluster_id,expires_at)
+		VALUES(?, ?, datetime('now','+1 day'))`, secretHash(token), id); err != nil {
+		writeError(w, http.StatusInternalServerError, "db error")
+		return
+	}
+	h.syncLog(id, "admin", "pair-generate", 0, "ok", name)
+	h.Log.WithField("cluster_id", id).Warn("operator minted a pairing token")
+	writeJSON(w, http.StatusOK, map[string]any{"status": "generated", "token": token, "expires_hours": 24})
+}
+
+// mintSecret creates a fresh cluster secret, stores only its hash, and
+// returns the plaintext (shown/stored once by the caller).
+func (h *Handler) mintSecret(clusterID string) (string, error) {
+	raw := make([]byte, 24)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	secret := hex.EncodeToString(raw)
+	if _, err := h.DB.Exec(`UPDATE clusters SET secret_hash=?,secret_set_at=? WHERE id=?`,
+		secretHash(secret), time.Now().UTC().Format(time.RFC3339), clusterID); err != nil {
+		return "", err
+	}
+	return secret, nil
+}
+
+// SyncPair handles POST /sync/pair — the agent exchanges a one-time pairing
+// token for its cluster secret. Public (the token IS the credential: 48 hex,
+// 24h expiry, single use). Every attempt — good or bad — lands in sync_log.
+func (h *Handler) SyncPair(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	req.Token = strings.TrimSpace(req.Token)
+	var clusterID, usedAt, expiresAt string
+	err := h.DB.QueryRow(`SELECT cluster_id,used_at,expires_at FROM pairing_tokens WHERE token_hash=?`,
+		secretHash(req.Token)).Scan(&clusterID, &usedAt, &expiresAt)
+	if err != nil || strings.TrimSpace(usedAt) != "" {
+		h.syncLog("", "in", "pair", 0, "denied", "unknown or used token")
+		writeError(w, http.StatusForbidden, "unknown or used pairing token")
+		return
+	}
+	if exp, err := time.Parse("2006-01-02 15:04:05", expiresAt); err != nil || !time.Now().UTC().Before(exp) {
+		h.syncLog("", "in", "pair", 0, "denied", "expired token")
+		writeError(w, http.StatusForbidden, "pairing token expired")
+		return
+	}
+	if _, err := h.DB.Exec(`UPDATE pairing_tokens SET used_at=datetime('now') WHERE token_hash=?`,
+		secretHash(req.Token)); err != nil {
+		writeError(w, http.StatusInternalServerError, "db error")
+		return
+	}
+	secret, err := h.mintSecret(clusterID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "cannot mint secret")
+		return
+	}
+	h.syncLog(clusterID, "out", "pair", 0, "ok", "paired, secret issued")
+	h.Log.WithField("cluster_id", clusterID).Warn("cluster paired via token, secret issued")
+	writeJSON(w, http.StatusOK, map[string]any{"status": "paired", "secret": secret})
+}
+
+// SyncRotate handles POST /sync/rotate — a synced cluster trades its current
+// secret for a fresh one (same guarantees as pairing, but authenticated by
+// the secret instead of a token). The agent calls this on its own schedule
+// (SYNC_ROTATE_DAYS); the old secret dies with the response.
+func (h *Handler) SyncRotate(w http.ResponseWriter, r *http.Request) {
+	clusterID, _, ok := h.syncAuth(r)
+	if !ok {
+		h.syncLog("", "in", "rotate", 0, "denied", "unknown or revoked key")
+		writeError(w, http.StatusForbidden, "unknown or revoked sync key")
+		return
+	}
+	secret, err := h.mintSecret(clusterID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "cannot mint secret")
+		return
+	}
+	h.syncLog(clusterID, "out", "rotate", 0, "ok", "rotated on agent request")
+	writeJSON(w, http.StatusOK, map[string]any{"status": "rotated", "secret": secret})
+}
+
+// normRoamID folds both account id spellings into the mirror's undashed
+// lowercase form.
+func normRoamID(id string) string {
+	return strings.ToLower(strings.ReplaceAll(strings.TrimSpace(id), "-", ""))
+}
+
+// SyncRoamDelegate handles POST /roam/delegate — a synced cluster asks, for
+// one of its logged-in users, for a roaming ticket (X-Sync-Key authed). The
+// user must exist in the mirror; the ticket is opaque, 5 minutes, reusable
+// within expiry (one user may roam to several clusters in a row).
+func (h *Handler) SyncRoamDelegate(w http.ResponseWriter, r *http.Request) {
+	clusterID, _, ok := h.syncAuth(r)
+	if !ok {
+		h.syncLog("", "in", "roam-delegate", 0, "denied", "unknown or revoked key")
+		writeError(w, http.StatusForbidden, "unknown or revoked sync key")
+		return
+	}
+	var req struct {
+		UserID string `json:"user_id"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	uid := normRoamID(req.UserID)
+	var username, email string
+	if err := h.DB.QueryRow(`SELECT username,email FROM sync_users WHERE user_id=?`, uid).Scan(&username, &email); err != nil {
+		h.syncLog(clusterID, "in", "roam-delegate", 0, "denied", "account not mirrored yet")
+		writeError(w, http.StatusNotFound, "account not mirrored yet (sync first, then roam)")
+		return
+	}
+	raw := make([]byte, 24)
+	if _, err := rand.Read(raw); err != nil {
+		writeError(w, http.StatusInternalServerError, "cannot mint ticket")
+		return
+	}
+	ticket := hex.EncodeToString(raw)
+	if _, err := h.DB.Exec(`INSERT INTO roam_tickets(token_hash,user_id,username,email,expires_at)
+		VALUES(?,?,?, ?,datetime('now','+5 minutes'))`, secretHash(ticket), uid, username, email); err != nil {
+		writeError(w, http.StatusInternalServerError, "db error")
+		return
+	}
+	h.syncLog(clusterID, "out", "roam-delegate", 0, "ok", username)
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "ticket": ticket,
+		"expires_in": 300, "user_id": uid, "username": username})
+}
+
+// SyncRoamVerify handles POST /roam/verify — another synced cluster (its own
+// X-Sync-Key) checks a roaming ticket and learns who it stands for. Expired
+// tickets are deleted on sight and read as unknown.
+func (h *Handler) SyncRoamVerify(w http.ResponseWriter, r *http.Request) {
+	clusterID, _, ok := h.syncAuth(r)
+	if !ok {
+		h.syncLog("", "in", "roam-verify", 0, "denied", "unknown or revoked key")
+		writeError(w, http.StatusForbidden, "unknown or revoked sync key")
+		return
+	}
+	var req struct {
+		Ticket string `json:"ticket"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	var uid, username, email, expires string
+	err := h.DB.QueryRow(`SELECT user_id,username,email,expires_at FROM roam_tickets WHERE token_hash=?`,
+		secretHash(strings.TrimSpace(req.Ticket))).Scan(&uid, &username, &email, &expires)
+	if err != nil {
+		h.syncLog(clusterID, "in", "roam-verify", 0, "denied", "unknown ticket")
+		writeError(w, http.StatusForbidden, "unknown or expired ticket")
+		return
+	}
+	if exp, err := time.Parse("2006-01-02 15:04:05", expires); err != nil || !time.Now().UTC().Before(exp) {
+		_, _ = h.DB.Exec(`DELETE FROM roam_tickets WHERE token_hash=?`, secretHash(strings.TrimSpace(req.Ticket)))
+		h.syncLog(clusterID, "in", "roam-verify", 0, "denied", "expired ticket")
+		writeError(w, http.StatusForbidden, "unknown or expired ticket")
+		return
+	}
+	h.syncLog(clusterID, "out", "roam-verify", 0, "ok", username)
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok",
+		"user_id": uid, "username": username, "email": email})
+}
+
 // AdminSyncLog handles GET /admin/api/synclog?limit= — the audit trail of
 // every sync communication, newest first.
 func (h *Handler) AdminSyncLog(w http.ResponseWriter, r *http.Request) {

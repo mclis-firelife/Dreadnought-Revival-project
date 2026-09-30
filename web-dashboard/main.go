@@ -140,6 +140,7 @@ func main() {
 
 	srv := &server{cfg: cfg, log: log, sessions: store, http: &http.Client{Timeout: 5 * time.Second}}
 	srv.startSampler() // gauge history for the overview graphs (JSONL, one line per minute)
+	srv.startScheduler() // scheduled tiles/broadcasts, checked every minute
 
 	r := mux.NewRouter()
 	r.Use(loggingMiddleware(log))
@@ -208,6 +209,11 @@ func main() {
 	api.HandleFunc("/setup-log", srv.apiSetupLog).Methods(http.MethodGet)
 	api.HandleFunc("/secrets", srv.apiSecretsGet).Methods(http.MethodGet)
 	api.HandleFunc("/secrets", srv.apiSecretsSet).Methods(http.MethodPost)
+	api.HandleFunc("/config-keys", srv.apiConfigKeys).Methods(http.MethodGet)
+	api.HandleFunc("/config-keys", srv.apiSetConfigKeys).Methods(http.MethodPost)
+	api.HandleFunc("/player-history", srv.apiPlayerHistory).Methods(http.MethodGet)
+	api.HandleFunc("/scheduled", srv.apiScheduled).Methods(http.MethodGet, http.MethodPost)
+	api.HandleFunc("/scheduled/{id}", srv.apiDeleteScheduled).Methods(http.MethodDelete)
 	api.HandleFunc("/ban", srv.apiBan).Methods(http.MethodPost)
 	api.HandleFunc("/unban", srv.apiUnban).Methods(http.MethodPost)
 	api.HandleFunc("/stop-instance/{id}", srv.apiStopInstance).Methods(http.MethodPost)

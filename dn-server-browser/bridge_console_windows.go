@@ -51,6 +51,7 @@ const browserBridgeJS = `<script>
   window.dnOpenLogs = () => dnCall('openLogs');
   window.dnSubmit = (m, u, i, p) => { dnCall('submit', [m, u, i, p]).then(dnAuthResult, e => dnAuthResult({ ok: false, error: String(e) })); };
   window.dnNews = () => { dnCall('news').then(dnNewsResult, e => dnNewsResult({ online: false, error: String(e) })); };
+  window.dnRoam = () => { dnCall('roam').then(dnRoamResult, e => dnRoamResult({ ok: false })); };
   window.dnCheckPresence = () => { dnCall('checkPresence').then(dnPresenceResult, e => dnPresenceResult({ checked: false })); };
   window.dnPlay = () => {
     dnCall('play').then(r => {
@@ -156,6 +157,8 @@ func runConsoleBrowser(exeDir string, api *browserAPI) error {
 			out = api.Submit(str(0), str(1), str(2), str(3))
 		case "news":
 			out = api.ClusterNews()
+		case "roam":
+			out = api.TryRoam()
 		case "checkPresence":
 			out = api.CheckPresence()
 		case "openLogs":

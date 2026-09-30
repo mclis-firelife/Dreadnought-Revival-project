@@ -68,6 +68,13 @@ func (h *Handler) StartCleanup() {
 				AND datetime(motd_until)<=datetime('now')`); err != nil {
 				h.Log.WithError(err).Warn("motd expiry cleanup")
 			}
+			// Expired roaming tickets and pairing tokens never come back.
+			if _, err := h.DB.Exec(`DELETE FROM roam_tickets WHERE datetime(expires_at)<=datetime('now')`); err != nil {
+				h.Log.WithError(err).Warn("roam tickets prune")
+			}
+			if _, err := h.DB.Exec(`DELETE FROM pairing_tokens WHERE used_at!='' OR datetime(expires_at)<=datetime('now')`); err != nil {
+				h.Log.WithError(err).Warn("pairing tokens prune")
+			}
 		}
 	}()
 }
@@ -324,12 +331,14 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]string{"id": id, fieldStatus: "registered"})
 }
 
-// Deregister handles DELETE /clusters/{id} — graceful goodbye (opt-out file,
-// shutdown). Stale rows age out on their own, so a lost cluster vanishes
-// without this; this is for the clean case.
+// Deregister handles DELETE /clusters/{id} — graceful goodbye (shutdown,
+// opt-out file). It marks the row offline INSTEAD of deleting it: the next
+// register (same name) revives the same row WITH its secret, agent URL and
+// history, so a plain stop/start or re-setup never orphans the cluster's
+// sync identity. True removal is AdminDelete.
 func (h *Handler) Deregister(w http.ResponseWriter, r *http.Request) {
 	id := mux.Vars(r)["id"]
-	res, err := h.DB.Exec(`DELETE FROM clusters WHERE id=?`, id)
+	res, err := h.DB.Exec(`UPDATE clusters SET status='offline' WHERE id=?`, id)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "deregistration failed")
 		return
@@ -342,7 +351,8 @@ func (h *Handler) Deregister(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "cluster not found")
 		return
 	}
-	h.Log.WithField("cluster_id", id).Info("cluster deregistered")
+	h.heartbeatEvent(id, "offline")
+	h.Log.WithField("cluster_id", id).Info("cluster deregistered (kept for re-register)")
 	writeJSON(w, http.StatusOK, map[string]string{fieldStatus: "deregistered"})
 }
 
