@@ -72,7 +72,11 @@ fleets, ships + ship XP, purchases, queue, live match, results),
 `/api/logs?name=…&lines=200` (allowlist, incl. `mmog-frames` = repo-root log
 and `battle-logs`), `/api/metrics-summary`, `/api/backups` (archives from
 `scripts/backup.sh`, read-only), `/api/crashes` (client crash reports: list +
-text view) and `/api/audit` (dashboard action log).
+text view), `/api/reports` (in-game bug reports from mmogbrain
+`client_reports`, newest first), `/api/series?metrics=…&range=…` (graph
+series, see below), `/api/sla?range=…` (per-service uptime percent from the
+sampler), `/api/events` + `DELETE /api/events/{id}` (operator markers drawn
+on the graphs) and `/api/audit` (dashboard action log).
 Writing (with frontend confirm): `POST /api/grant` (credits/premium/free-XP
 to one player), `POST /api/grant-all` (same amounts to **every** account
 with game data), `POST /api/provision` (equip test account live, values are
@@ -99,3 +103,43 @@ fresh balances (`YA_RewardCurrencies`) to connected clients — no relog needed.
   no request can open an arbitrary path.
 - IDs are validated (instances = UUID, usernames = `admin-cli` rule,
   grants only 32-hex + amounts 0…1e9).
+
+### Overview graphs (tile backgrounds + ranges)
+Every overview tile carries its history as a background sparkline (SVG behind
+the number — same tile size). Range selector: 2 min, 1 hour, 24 hours,
+7 / 14 days, 30 days, 1 year, all time (default).
+
+- Counters (accounts, matches, kills, credits, reports) bucket straight from
+  mmogbrain tables by `created_at`, so they reach back to the database
+  beginning. Served by mmogbrain `GET /admin/api/series?metric=&from=&to=`
+  (both timestamp spellings; unknown metric 400; missing table answers
+  empty, never 500).
+- Gauges (online, queued, instances, servers, matches) have no history table
+  anywhere, so the dashboard records its own: one JSON line per minute into
+  `run/web-dashboard-samples.jsonl` (capped ~370 days, oldest tenth dropped
+  on overflow; path via `DASH_HIST_FILE`). The UI prints `recorded_since` so
+  a fresh install does not pretend to a year of lines.
+- One call serves all tiles: `GET /api/series?metrics=a,b&range=24h`.
+- Extra overview data in the same pass: mmogbrain uptime, 24h sums, mode
+  split, host crash classification (stack overflow / access violation /
+  clean over the newest 40 battle logs), top-5 killers, and a Reports tab
+  for the in-game bug reports. Players table gained Ships/Matches/Wins/
+  Kills columns (the data was already proxied).
+- Second wave: SLA panel (`/api/sla`, same ranges), activity heatmap
+  (weekday x hour from the match archive), queue ETA estimate (median match
+  pace x queue depth, labelled as estimate), grant presets (localStorage),
+  CSV export (players, matches), event markers on the graphs, global player
+  search, per-team balance in match detail, economy card (match payouts vs
+  store spending — mmogbrain series metric `spending`, credit purchases
+  only), session stats (peak/average/busiest hour from samples),
+  one-click maintenance mode (launcher tile + chat broadcast, same click
+  removes both).
+
+### Setup tab, service control, first run
+
+The dashboard can bootstrap and operate the stack without touching the shipped scripts:
+
+- \web-dashboard/start.sh\ starts only the dashboard (own pidfile, own log). \ADMIN_KEY\ resolves env, then run/secrets.env, then run/web-dashboard.env, then freshly generated into the latter (0600). After the first setup the operator copies that key into secrets.env (the Setup tab shows the source). \web-dashboard/stop.sh\ stops it.
+- Setup tab: checklist (secrets.env, JWT/ADMIN_KEY, GAME_BINARY, Go, Wine, binaries, running services), service table with per-service stop (pidfile + process check, never blind, never itself), Start-all / Stop-all (run the shipped scripts, output streams to run/web-dashboard-setup.log with follow mode), raw secrets.env editor (lossless, 0600), setup runner (\scripts/setup.sh\).
+- First run: with no secrets.env the UI lands on Setup instead of Overview.
+- New data tabs/cards in this wave: sleepers (dormant accounts, mmogbrain \/admin/api/sleepers\), wealth brackets (\/admin/api/wealth\), most-flown hulls (\/admin/api/ships\), per-mode balance (\/admin/api/mode-stats\), weekday peaks in Sessions, audit timeline, economy card (payouts vs spending).

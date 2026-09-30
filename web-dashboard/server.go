@@ -276,7 +276,20 @@ func (s *server) apiStatus(w http.ResponseWriter, _ *http.Request) {
 	if code, doc := s.upstreamGet(s.cfg.mmogURL, "/admin/online", s.cfg.adminKey, nil); code == http.StatusOK {
 		online = int(jsonNumber(doc["count"]))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	// Best-effort history extras from mmogbrain's admin overview (one call):
+	// uptime, account/match/result totals, 24h sums, mode split, host crash
+	// classification. Missing on older mmogbrain builds: tiles stay blank.
+	extras := map[string]any{}
+	if code, doc := s.upstreamGet(s.cfg.mmogURL, "/admin/api/overview", s.cfg.adminKey, nil); code == http.StatusOK {
+		for _, k := range []string{"uptime_seconds", "accounts", "new_accounts_24h",
+			"matches_total", "matches_24h", "results_24h", "kills_24h", "credits_paid_24h",
+			"reports_24h", "modes_24h", "host_crashes_recent"} {
+			if v, ok := doc[k]; ok {
+				extras[k] = v
+			}
+		}
+	}
+	out := map[string]any{
 		"services":       services,
 		"up":             up,
 		"total":          len(targets),
@@ -286,7 +299,11 @@ func (s *server) apiStatus(w http.ResponseWriter, _ *http.Request) {
 		"servers":        servers,
 		"online":         online,
 		"time":           time.Now().UTC().Format(time.RFC3339),
-	})
+	}
+	for k, v := range extras {
+		out[k] = v
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func jsonNumber(v any) float64 {
@@ -360,6 +377,20 @@ func (s *server) apiAccounts(w http.ResponseWriter, _ *http.Request) {
 		Premium       int64  `json:"premium"`
 		FreeXP        int64  `json:"free_xp"`
 		Rank          int    `json:"rank"`
+		Ships         int    `json:"ships"`
+		Matches       int    `json:"matches"`
+		Wins          int    `json:"wins"`
+		Kills         int    `json:"kills"`
+	}
+	fillStats := func(a *account, p map[string]any) {
+		a.Credits = int64(jsonNumber(p["credits"]))
+		a.Premium = int64(jsonNumber(p["premium"]))
+		a.FreeXP = int64(jsonNumber(p["free_xp"]))
+		a.Rank = int(jsonNumber(p["rank"]))
+		a.Ships = int(jsonNumber(p["ships"]))
+		a.Matches = int(jsonNumber(p["matches"]))
+		a.Wins = int(jsonNumber(p["wins"]))
+		a.Kills = int(jsonNumber(p["kills"]))
 	}
 	out := []account{}
 	seen := map[string]bool{}
@@ -387,10 +418,7 @@ func (s *server) apiAccounts(w http.ResponseWriter, _ *http.Request) {
 				seen[normJoinID(id)] = true
 				a.PlayerID, _ = p["user_id"].(string)
 				a.HasPlayerData = true
-				a.Credits = int64(jsonNumber(p["credits"]))
-				a.Premium = int64(jsonNumber(p["premium"]))
-				a.FreeXP = int64(jsonNumber(p["free_xp"]))
-				a.Rank = int(jsonNumber(p["rank"]))
+				fillStats(&a, p)
 			}
 			out = append(out, a)
 		}
@@ -401,15 +429,13 @@ func (s *server) apiAccounts(w http.ResponseWriter, _ *http.Request) {
 		}
 		name, _ := p["display_name"].(string)
 		pid, _ := p["user_id"].(string)
-		out = append(out, account{
+		a := account{
 			Username:      name,
 			PlayerID:      pid,
 			HasPlayerData: true,
-			Credits:       int64(jsonNumber(p["credits"])),
-			Premium:       int64(jsonNumber(p["premium"])),
-			FreeXP:        int64(jsonNumber(p["free_xp"])),
-			Rank:          int(jsonNumber(p["rank"])),
-		})
+		}
+		fillStats(&a, p)
+		out = append(out, a)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"accounts": out, "count": len(out)})
 }
@@ -480,6 +506,39 @@ func (s *server) apiResults(w http.ResponseWriter, r *http.Request) {
 	code, doc := s.upstreamGet(s.cfg.mmogURL, "/admin/results", s.cfg.adminKey, map[string]string{
 		"limit": r.URL.Query().Get("limit"),
 	})
+	writeJSON(w, codeOr(code), doc)
+}
+
+// apiReports proxies mmogbrain's client reports: in-game bug reports with
+// player, type and details. Present in mmogbrain's own admin page but had no
+// web-dashboard tab until now.
+func (s *server) apiReports(w http.ResponseWriter, _ *http.Request) {
+	code, doc := s.upstreamGet(s.cfg.mmogURL, "/admin/api/reports", s.cfg.adminKey, nil)
+	writeJSON(w, codeOr(code), doc)
+}
+
+// apiSleepers proxies dormant accounts; apiWealth the currency brackets;
+// apiShips the most-flown hulls; apiModeStats per-mode balance. All four are
+// mmogbrain admin data the web-dashboard renders, same pattern as reports.
+func (s *server) apiSleepers(w http.ResponseWriter, r *http.Request) {
+	code, doc := s.upstreamGet(s.cfg.mmogURL, "/admin/api/sleepers", s.cfg.adminKey, map[string]string{
+		"days": r.URL.Query().Get("days"),
+	})
+	writeJSON(w, codeOr(code), doc)
+}
+
+func (s *server) apiWealth(w http.ResponseWriter, _ *http.Request) {
+	code, doc := s.upstreamGet(s.cfg.mmogURL, "/admin/api/wealth", s.cfg.adminKey, nil)
+	writeJSON(w, codeOr(code), doc)
+}
+
+func (s *server) apiShips(w http.ResponseWriter, _ *http.Request) {
+	code, doc := s.upstreamGet(s.cfg.mmogURL, "/admin/api/ships", s.cfg.adminKey, nil)
+	writeJSON(w, codeOr(code), doc)
+}
+
+func (s *server) apiModeStats(w http.ResponseWriter, _ *http.Request) {
+	code, doc := s.upstreamGet(s.cfg.mmogURL, "/admin/api/mode-stats", s.cfg.adminKey, nil)
 	writeJSON(w, codeOr(code), doc)
 }
 

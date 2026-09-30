@@ -21,6 +21,10 @@ run/
 # Documentation with sensitive data
 SERVER_RUNNING.md
 
+# Session changelog (local only, never committed): implementation-first
+# entries plus the focused change, from web-dashboard onward.
+Changes.md
+
 # Logs
 *.log
 logs/

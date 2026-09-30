@@ -34,9 +34,12 @@ request**, but `contact_email` is required), `POST /clusters/{id}/heartbeat`,
 `DELETE /clusters/{id}`, `GET /clusters` (public, online only), plus the
 operator dashboard under `/admin` (HTTP Basic, `MASTER_ADMIN_PASSWORD`):
 full list incl. stale and blocked, MOTD editing, **secret generate/revoke/
-send-to-cluster (https only)**, block/unblock, delete — plus user mirror
+send-to-cluster (https only)**, block/unblock (optional reason + auto-expiry
+in minutes; elapsed blocks lift on the next heartbeat), delete — plus user
+mirror
 (search, balances, ban state) and the sync audit log (every communication
-logged, both directions). The dashboard signs in per page load: the password
+logged, both directions). `POST /admin/api/motd-all` writes one MOTD to all
+clusters. The dashboard signs in per page load: the password
 lives only in the page's JS memory (no cookie, no storage), so every fresh
 open and every refresh asks again — the browser never gets a chance to cache
 it. The JSON API behind the page stays Basic-authed per request.
@@ -234,7 +237,17 @@ player. Design notes:
   them. Accounts that exist only elsewhere are kept, never deleted. If the
   main cluster fails, nobody else is touched. The main cluster is picked in
   the dashboard and stored in the directory DB. Every manual run lands in
-  the sync audit log like interval traffic.
+  the sync audit log like interval traffic. **Preview rollout** shows the
+  counts first (accounts from main, snapshots that would flip, kept-only-
+  elsewhere accounts) without touching anything. The **sync status** panel
+  shows secret age (with one-click rotation), agent URL,
+  last-push/last-pull/mirrored-accounts per cluster with
+  an agent reachability test; the **presence board** shows live mid-match
+  accounts across clusters; the **heartbeat history** shows online/offline
+  transitions per cluster (30 days); the **account sources** chart shows
+  which cluster contributed how many mirrored accounts. Operator **notes**
+  per cluster, **broadcast MOTD** to all, **temporary blocks** (reason +
+  auto-expiry), and a **directory backup** download round out the panel.
 - **Not synced, on purpose:** sessions (login tokens stay local),
   queue/matches/slots (live matchmaking), battle results + match history
   (per-cluster audit), chat.

@@ -154,6 +154,20 @@ func newAdminRouter(h *handlers.Handler, password string, log *logrus.Logger) ht
 	admin.HandleFunc("/api/sync-settings", h.AdminSyncSettings).Methods(http.MethodGet, http.MethodPost)
 	admin.HandleFunc("/api/sync-now", h.AdminSyncNow).Methods(http.MethodPost)
 	admin.HandleFunc("/api/rollout", h.AdminRollout).Methods(http.MethodPost)
+	admin.HandleFunc("/api/rollout-preview", h.AdminRolloutPreview).Methods(http.MethodGet)
+	admin.HandleFunc("/api/syncstatus", h.AdminSyncStatus).Methods(http.MethodGet)
+	admin.HandleFunc("/api/presence", h.AdminPresence).Methods(http.MethodGet)
+	admin.HandleFunc("/api/heartbeat-history", h.AdminHeartbeatHistory).Methods(http.MethodGet)
+	admin.HandleFunc("/api/uptime", h.AdminUptime).Methods(http.MethodGet)
+	admin.HandleFunc("/api/sync-volume", h.AdminSyncVolume).Methods(http.MethodGet)
+	admin.HandleFunc("/api/growth", h.AdminGrowth).Methods(http.MethodGet)
+	admin.HandleFunc("/api/sync-errors", h.AdminSyncErrors).Methods(http.MethodGet)
+	admin.HandleFunc("/api/duplicates", h.AdminDuplicates).Methods(http.MethodGet)
+	admin.HandleFunc("/api/sources", h.AdminSources).Methods(http.MethodGet)
+	admin.HandleFunc("/api/backup", h.AdminBackup).Methods(http.MethodGet)
+	admin.HandleFunc("/api/motd-all", h.AdminMotdAll).Methods(http.MethodPost)
+	admin.HandleFunc("/api/clusters/{id}/ping", h.AdminPingAgent).Methods(http.MethodPost)
+	admin.HandleFunc("/api/clusters/{id}/note", h.AdminSetNote).Methods(http.MethodPost)
 	return r
 }
 

@@ -26,10 +26,12 @@
   <div class="brand"><span class="logo">◈</span> Dreadnought <b>Ops</b></div>
   <nav class="tabs" id="tabs">
     <button data-tab="overview" class="active">Overview</button>
+    <button data-tab="setup">Setup</button>
     <button data-tab="online">Online</button>
     <button data-tab="players">Players</button>
     <button data-tab="queue">Queue</button>
     <button data-tab="matches">Matches</button>
+    <button data-tab="reports">Reports</button>
     <button data-tab="servers">Servers</button>
     <button data-tab="chat">Chat</button>
     <button data-tab="news">News</button>
@@ -43,6 +45,7 @@
   <div class="top-right">
     <span id="live-dot" class="live-dot" title="Polling status">●</span>
     <span id="clock" class="clock">--:--:--</span>
+    <input id="global-search" placeholder="Player search …" style="width:170px">
     <button id="logout-btn" class="btn ghost">Logout</button>
   </div>
 </header>
@@ -51,28 +54,128 @@
   <!-- OVERVIEW -->
   <section id="tab-overview" class="tab active">
     <div id="alerts"></div>
+    <div class="rangebar" id="rangebar">
+      <span class="muted-sm">Range:</span>
+      <button data-range="2m">2 min</button>
+      <button data-range="1h">1 hour</button>
+      <button data-range="24h">24 hours</button>
+      <button data-range="7d">7 days</button>
+      <button data-range="14d">14 days</button>
+      <button data-range="30d">30 days</button>
+      <button data-range="1y">1 year</button>
+      <button data-range="all" class="active">All time</button>
+      <span class="muted-sm" id="recorded-note"></span>
+    </div>
     <div class="hero-grid">
-      <div class="hero-card glass"><div class="hero-label">Services online</div><div class="hero-value" id="hero-up">–</div><div class="hero-sub" id="hero-up-sub">–</div></div>
-      <div class="hero-card glass"><div class="hero-label">Players in queue</div><div class="hero-value" id="hero-queue">–</div><div class="hero-sub">waiting for match</div></div>
-      <div class="hero-card glass"><div class="hero-label">Active matches</div><div class="hero-value" id="hero-matches">–</div><div class="hero-sub">per mmogbrain</div></div>
-      <div class="hero-card glass"><div class="hero-label">Battle instances</div><div class="hero-value" id="hero-instances">–</div><div class="hero-sub" id="hero-instances-sub">–</div></div>
-      <div class="hero-card glass"><div class="hero-label">Registered servers</div><div class="hero-value" id="hero-servers">–</div><div class="hero-sub">master browser</div></div>
-      <div class="hero-card glass"><div class="hero-label">Online</div><div class="hero-value" id="hero-online">–</div><div class="hero-sub">connected players</div></div>
+      <div class="hero-card glass"><svg class="spark" id="spark-up" preserveAspectRatio="none"></svg><div class="hero-label">Services online</div><div class="hero-value" id="hero-up">–</div><div class="hero-sub" id="hero-up-sub">–</div></div>
+      <div class="hero-card glass"><svg class="spark" id="spark-queue" preserveAspectRatio="none"></svg><div class="hero-label">Players in queue</div><div class="hero-value" id="hero-queue">–</div><div class="hero-sub">waiting for match</div></div>
+      <div class="hero-card glass"><svg class="spark" id="spark-matches" preserveAspectRatio="none"></svg><div class="hero-label">Active matches</div><div class="hero-value" id="hero-matches">–</div><div class="hero-sub">per mmogbrain</div></div>
+      <div class="hero-card glass"><svg class="spark" id="spark-instances" preserveAspectRatio="none"></svg><div class="hero-label">Battle instances</div><div class="hero-value" id="hero-instances">–</div><div class="hero-sub" id="hero-instances-sub">–</div></div>
+      <div class="hero-card glass"><svg class="spark" id="spark-servers" preserveAspectRatio="none"></svg><div class="hero-label">Registered servers</div><div class="hero-value" id="hero-servers">–</div><div class="hero-sub">master browser</div></div>
+      <div class="hero-card glass"><svg class="spark" id="spark-online" preserveAspectRatio="none"></svg><div class="hero-label">Online</div><div class="hero-value" id="hero-online">–</div><div class="hero-sub">connected players</div></div>
+    </div>
+    <div class="hero-grid">
+      <div class="hero-card glass"><svg class="spark" id="spark-accounts" preserveAspectRatio="none"></svg><div class="hero-label">Accounts</div><div class="hero-value" id="tile-accounts">–</div><div class="hero-sub" id="tile-accounts-sub">registered</div></div>
+      <div class="hero-card glass"><svg class="spark" id="spark-matches-total" preserveAspectRatio="none"></svg><div class="hero-label">Matches played</div><div class="hero-value" id="tile-matches">–</div><div class="hero-sub">in range</div></div>
+      <div class="hero-card glass"><svg class="spark" id="spark-kills" preserveAspectRatio="none"></svg><div class="hero-label">Kills</div><div class="hero-value" id="tile-kills">–</div><div class="hero-sub">in range</div></div>
+      <div class="hero-card glass"><svg class="spark" id="spark-credits" preserveAspectRatio="none"></svg><div class="hero-label">Credits paid out</div><div class="hero-value" id="tile-credits">–</div><div class="hero-sub">match rewards, in range</div></div>
+      <div class="hero-card glass"><svg class="spark" id="spark-reports" preserveAspectRatio="none"></svg><div class="hero-label">Client reports</div><div class="hero-value" id="tile-reports">–</div><div class="hero-sub">in-game bug reports, in range</div></div>
+      <div class="hero-card glass"><div class="hero-label">mmogbrain uptime</div><div class="hero-value" id="tile-uptime">–</div><div class="hero-sub" id="tile-uptime-sub">–</div></div>
+    </div>
+    <div class="hero-grid">
+      <div class="hero-card glass"><div class="hero-label">Host crashes · stack overflow</div><div class="hero-value" id="tile-crash-stack">–</div><div class="hero-sub">last 40 battle logs</div></div>
+      <div class="hero-card glass"><div class="hero-label">Host crashes · access violation</div><div class="hero-value" id="tile-crash-av">–</div><div class="hero-sub">last 40 battle logs</div></div>
+      <div class="hero-card glass"><div class="hero-label">Clean hosts</div><div class="hero-value" id="tile-crash-clean">–</div><div class="hero-sub">last 40 battle logs</div></div>
     </div>
     <div class="grid-2">
       <div class="card glass">
-        <h2>Services</h2>
+        <div class="row-between"><h2>Services</h2>
+        <button id="sla-reload" class="btn">↻</button></div>
         <div id="service-grid" class="service-grid"></div>
+        <h2 style="margin-top:14px">Uptime in range <span class="muted-sm" id="sla-note"></span></h2>
+        <div id="sla-box" class="kv"></div>
       </div>
+      <div class="card glass">
+        <h2>Top pilots <span class="muted-sm">by kills, all time</span></h2>
+        <div class="table-wrap"><table id="top-table">
+          <thead><tr><th>#</th><th>Pilot</th><th>Kills</th><th>Wins</th><th>Matches</th></tr></thead>
+          <tbody><tr><td colspan="5" class="muted">Loading…</td></tr></tbody>
+        </table></div>
+        <p class="hint" id="modes-row"></p>
+      </div>
+    </div>
+    <div class="grid-2">
+      <div class="card glass">
+        <h2>Economy <span class="muted-sm">credits in range</span></h2>
+        <div class="row-between"><span>Match payouts</span><b id="eco-payouts">–</b></div>
+        <svg class="widespark" id="spark-eco-payouts" preserveAspectRatio="none"></svg>
+        <div class="row-between"><span>Store spending</span><b id="eco-spending">–</b></div>
+        <svg class="widespark" id="spark-eco-spending" preserveAspectRatio="none"></svg>
+        <p class="hint" id="eco-note"></p>
+      </div>
+      <div class="card glass">
+        <h2>Sessions <span class="muted-sm">from online samples</span></h2>
+        <div id="session-box" class="kv"><p class="muted">Loading…</p></div>
+      </div>
+    </div>
+    <div class="grid-2">
       <div class="card glass">
         <h2>Live history <span class="muted-sm">last ~5 min</span></h2>
         <canvas id="chart-history" height="180"></canvas>
         <div class="legend"><span><i class="sw q"></i>Queue</span><span><i class="sw m"></i>Matches</span><span><i class="sw i"></i>Instances</span></div>
       </div>
+      <div class="card glass">
+        <h2>Events</h2>
+        <div id="event-feed" class="feed"><p class="muted">No status changes this session.</p></div>
+        <h2 style="margin-top:14px">Markers <span class="muted-sm">drawn on the graphs</span></h2>
+        <div class="row">
+          <input id="marker-label" placeholder="Restart, deploy, event …" style="flex:1;min-width:200px">
+          <button id="marker-add" class="btn">Add marker (now)</button>
+        </div>
+        <div id="marker-list" class="feed"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- SETUP -->
+  <section id="tab-setup" class="tab">
+    <div class="card glass">
+      <div class="row-between"><h2>First-run setup & services</h2>
+      <button id="setup-reload" class="btn">↻ Reload</button></div>
+      <p class="hint" id="setup-banner">No <code>run/secrets.env</code> yet — work through the steps below, then start everything.</p>
+      <div id="setup-checklist" class="kv"></div>
     </div>
     <div class="card glass">
-      <h2>Events</h2>
-      <div id="event-feed" class="feed"><p class="muted">No status changes this session.</p></div>
+      <div class="row-between"><h2>Services</h2>
+      <div class="row"><button id="svc-start-all" class="btn primary">Start all</button>
+      <button id="svc-stop-all" class="btn danger">Stop all</button></div></div>
+      <div class="table-wrap"><table id="svc-table">
+        <thead><tr><th>Service</th><th>State</th><th>Action</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+      <p class="hint">Start-all runs <code>scripts/start-services.sh</code> (skips what runs). Stop-one kills by pidfile after a process check — never blind, never this dashboard.</p>
+    </div>
+    <div class="grid-2">
+      <div class="card glass">
+        <h2>Run setup</h2>
+        <p class="muted">Runs <code>scripts/setup.sh</code> (toolchain check, certs, secrets, builds). Takes minutes; output streams below.</p>
+        <button id="setup-run" class="btn primary">Run setup</button>
+        <span id="setup-job" class="pill"></span>
+      </div>
+      <div class="card glass">
+        <h2>secrets.env</h2>
+        <p class="muted">Raw editor (comments preserved, mode 600). Services pick it up on (re)start; the dashboard keeps its startup key — its current source is shown in the checklist.</p>
+        <div class="row"><button id="secrets-reload" class="btn">↻ Reload</button><button id="secrets-save" class="btn primary">Save</button></div>
+      </div>
+    </div>
+    <div class="card glass">
+      <textarea id="secrets-text" spellcheck="false" style="width:100%;min-height:280px;font:12px Consolas,monospace"></textarea>
+    </div>
+    <div class="card glass">
+      <div class="row-between"><h2>Job log</h2>
+      <div class="row"><label class="chk"><input type="checkbox" id="setup-follow" checked> Follow</label>
+      <button id="setup-log-reload" class="btn">↻ Reload</button></div></div>
+      <pre id="setup-log" class="logview"></pre>
     </div>
   </section>
 
@@ -96,14 +199,32 @@
         <h2>Players <span id="accounts-count" class="pill"></span></h2>
         <div class="row">
           <input id="accounts-search" placeholder="Search (name / email / ID) …">
+          <button id="accounts-csv" class="btn">⤓ CSV</button>
           <button id="accounts-reload" class="btn">↻ Reload</button>
         </div>
       </div>
       <p class="hint">Every <b>registered</b> account (auth server) with live balance (mmogbrain). No game data: never been in game.</p>
       <div class="table-wrap"><table id="accounts-table">
-        <thead><tr><th>Username</th><th>Email</th><th>Player ID</th><th>Credits</th><th>Premium</th><th>Free XP</th><th>Rank</th><th>Status</th><th>Actions</th></tr></thead>
+        <thead><tr><th>Username</th><th>Email</th><th>Player ID</th><th>Credits</th><th>Premium</th><th>Free XP</th><th>Rank</th><th>Ships</th><th>Matches</th><th>Wins</th><th>Kills</th><th>Status</th><th>Actions</th></tr></thead>
         <tbody></tbody>
       </table></div>
+    </div>
+    <div class="grid-2">
+      <div class="card glass">
+        <div class="row-between"><h2>Sleepers <span id="sleepers-count" class="pill"></span></h2>
+        <div class="row"><select id="sleepers-days"><option value="7">7 days</option><option value="30" selected>30 days</option><option value="90">90 days</option></select>
+        <button id="sleepers-reload" class="btn">↻</button></div></div>
+        <div class="table-wrap"><table id="sleepers-table">
+          <thead><tr><th>Pilot</th><th>Rank</th><th>Last login</th></tr></thead>
+          <tbody></tbody>
+        </table></div>
+        <p class="hint">Dormant accounts for win-back events.</p>
+      </div>
+      <div class="card glass">
+        <h2>Wealth distribution <span class="muted-sm">soft currency</span></h2>
+        <div id="wealth-box"></div>
+        <p class="hint">For economy tuning: where the money sits.</p>
+      </div>
     </div>
     <div class="card glass" id="player-detail-card">
       <h2>Player details</h2>
@@ -138,7 +259,14 @@
         <label>Free XP<input id="grant-all-xp" type="number" min="0" value="5000"></label>
         <button id="grant-all-btn" class="btn primary">Give to all</button>
       </div>
+      <div class="row">
+        <label>Preset<select id="grant-preset"></select></label>
+        <button id="grant-preset-apply" class="btn">Apply preset</button>
+        <button id="grant-preset-save" class="btn">Save current…</button>
+        <button id="grant-preset-del" class="btn danger">Delete preset</button>
+      </div>
       <div id="grant-all-result" class="hint"></div>
+      <p class="hint">Presets live in this browser (localStorage).</p>
     </div>
     <div class="grid-2">
       <div class="card glass">
@@ -194,6 +322,7 @@
         <button id="queue-reload" class="btn">↻ Reload</button>
       </div></div>
       <canvas id="chart-queue" height="120"></canvas>
+      <div class="row-between"><p class="hint" id="queue-eta">Estimated wait: –</p></div>
       <div class="table-wrap"><table id="queue-table">
         <thead><tr><th>ID</th><th>User</th><th>Mode</th><th>Tier</th><th>Status</th><th>Queued at</th><th>Action</th></tr></thead>
         <tbody></tbody>
@@ -211,6 +340,23 @@
         <tbody></tbody>
       </table></div>
       <p class="hint">Stop = <code>DELETE /instances/{id}</code> on the control plane (:8085). UUID-guarded, with confirmation.</p>
+    </div>
+    <div class="grid-2">
+      <div class="card glass">
+        <h2>Most-flown hulls <span class="muted-sm">by ship XP</span></h2>
+        <div class="table-wrap"><table id="ships-table">
+          <thead><tr><th>Hull</th><th>Total XP</th><th>Pilots</th></tr></thead>
+          <tbody><tr><td colspan="3" class="muted">Loading…</td></tr></tbody>
+        </table></div>
+      </div>
+      <div class="card glass">
+        <h2>Balance by mode <span class="muted-sm">wins and kills</span></h2>
+        <div class="table-wrap"><table id="modes-table">
+          <thead><tr><th>Mode</th><th>Matches</th><th>Won</th><th>Win %</th><th>Kills</th></tr></thead>
+          <tbody><tr><td colspan="5" class="muted">Loading…</td></tr></tbody>
+        </table></div>
+        <p class="hint">Win % far from the mode's team split means stomps — see match detail for team splits.</p>
+      </div>
     </div>
     <div class="card glass">
       <div class="row-between"><h2>Match results <span id="results-count" class="pill"></span></h2>
@@ -238,12 +384,30 @@
     </div>
     <div class="card glass">
       <div class="row-between"><h2>Match history <span id="history-count" class="pill"></span></h2>
-      <button id="history-reload" class="btn">↻ Reload</button></div>
+      <div class="row"><button id="history-csv" class="btn">⤓ CSV</button><button id="history-reload" class="btn">↻ Reload</button></div></div>
       <div class="table-wrap"><table id="history-table">
         <thead><tr><th>ID</th><th>Mode</th><th>Map</th><th>Started</th><th>Players</th><th>Roster</th></tr></thead>
         <tbody></tbody>
       </table></div>
       <p class="hint">Legacy match archive (written by match-result reporting).</p>
+    </div>
+    <div class="card glass">
+      <h2>Activity heatmap <span class="muted-sm">matches by weekday × hour</span></h2>
+      <div class="table-wrap"><table id="heatmap-table"></table></div>
+      <p class="hint">From the match archive (up to 500 recent matches). Darker = busier.</p>
+    </div>
+  </section>
+
+  <!-- REPORTS -->
+  <section id="tab-reports" class="tab">
+    <div class="card glass">
+      <div class="row-between"><h2>Client reports <span id="reports-count" class="pill"></span></h2>
+      <button id="reports-reload" class="btn">↻ Reload</button></div>
+      <div class="table-wrap"><table id="reports-table">
+        <thead><tr><th>#</th><th>When</th><th>Player</th><th>Type</th><th>Name</th><th>Details</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+      <p class="hint">In-game bug reports, newest first (mmogbrain client_reports, 150 max).</p>
     </div>
   </section>
 
@@ -299,6 +463,16 @@
       <label>Title<input id="tile-title" placeholder="…"></label>
       <label>Text<input id="tile-body" placeholder="…"></label>
       <button id="tile-save" class="btn primary">Save</button>
+    </div>
+    <div class="card glass">
+      <h2>Maintenance mode</h2>
+      <p class="muted">One click: maintenance tile on the launcher + broadcast to chat. Stop removes the tile and sends the all-clear.</p>
+      <div class="row">
+        <input id="maint-message" placeholder="Servers restart in 10 minutes …" style="flex:1;min-width:240px">
+        <button id="maint-start" class="btn danger">Start maintenance</button>
+        <button id="maint-stop" class="btn">End maintenance</button>
+      </div>
+      <div id="maint-state" class="hint"></div>
     </div>
   </section>
 
@@ -361,6 +535,7 @@
     <div class="card glass">
       <div class="row-between"><h2>Audit log <span id="audit-count" class="pill"></span></h2>
       <button id="audit-reload" class="btn">↻ Reload</button></div>
+      <div id="audit-timeline"></div>
       <div class="table-wrap"><table id="audit-table">
         <thead><tr><th>Time</th><th>Action</th><th>Detail</th></tr></thead>
         <tbody></tbody>

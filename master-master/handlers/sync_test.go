@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gorilla/mux"
 )
@@ -435,5 +436,331 @@ func TestAdminRolloutNeedsMain(t *testing.T) {
 	h.AdminRollout(rec, httptest.NewRequest(http.MethodPost, "/admin/api/rollout", nil))
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestAdminSyncStatus(t *testing.T) {
+	h := testHandler(t)
+	seedSyncCluster(t, h)
+	cid := "11111111-2222-3333-4444-555555555555"
+	if _, err := h.DB.Exec(`INSERT INTO sync_log(cluster_id,direction,endpoint,users,status,detail)
+		VALUES(?,'in','push',5,'ok',''),(?,'out','pull',3,'ok','')`, cid, cid); err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	h.AdminSyncStatus(rec, httptest.NewRequest(http.MethodGet, "/admin/api/syncstatus", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d", rec.Code)
+	}
+	var doc struct {
+		Clusters []struct {
+			Name          string `json:"name"`
+			HasSecret     bool   `json:"has_secret"`
+			LastPush      string `json:"last_push"`
+			LastPushState string `json:"last_push_status"`
+			LastPull      string `json:"last_pull"`
+		} `json:"clusters"`
+		Count int `json:"count"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if doc.Count != 1 {
+		t.Fatalf("count = %d: %s", doc.Count, rec.Body.String())
+	}
+	c := doc.Clusters[0]
+	if !c.HasSecret || c.LastPush == "" || c.LastPushState != "ok" || c.LastPull == "" {
+		t.Fatalf("unexpected status row: %+v", c)
+	}
+}
+
+func TestAdminPresenceBoard(t *testing.T) {
+	h := testHandler(t)
+	seedSyncCluster(t, h)
+	cid := "11111111-2222-3333-4444-555555555555"
+	uid := "ffffffffffffffffffffffffffffffff"
+	if _, err := h.DB.Exec(`INSERT INTO sync_users(user_id,username,email) VALUES(?,'zara','z@x.org')`, uid); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := h.DB.Exec(`INSERT INTO sync_presence(user_id,cluster_id,in_match,updated_at)
+		VALUES(?,?,1,?), (?,'other',1,'2020-01-01T00:00:00Z')`, uid, cid, now, uid); err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	h.AdminPresence(rec, httptest.NewRequest(http.MethodGet, "/admin/api/presence", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d", rec.Code)
+	}
+	var doc struct {
+		Players []struct {
+			Username string `json:"username"`
+			Cluster  string `json:"cluster"`
+		} `json:"players"`
+		Count int `json:"count"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if doc.Count != 1 || doc.Players[0].Username != "zara" || doc.Players[0].Cluster != "Sync Cluster" {
+		t.Fatalf("unexpected board: %s", rec.Body.String())
+	}
+}
+
+func TestAdminRolloutPreview(t *testing.T) {
+	h := testHandler(t)
+	seedSyncCluster(t, h)
+	cid := "11111111-2222-3333-4444-555555555555"
+	if err := h.setSetting("main_cluster_id", cid); err != nil {
+		t.Fatal(err)
+	}
+	rec, req := authedSyncReq(t, "POST", "/sync/push", pushPayload("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "2026-09-29T10:00:00Z"), syncTestKey)
+	h.SyncPush(rec, req)
+	rec = httptest.NewRecorder()
+	h.AdminRolloutPreview(rec, httptest.NewRequest(http.MethodGet, "/admin/api/rollout-preview", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	var doc struct {
+		UsersTotal         int `json:"users_total"`
+		UsersMain          int `json:"users_main"`
+		UsersOnlyElsewhere int `json:"users_only_elsewhere"`
+		SnapshotsFlipping  int `json:"snapshots_flipping"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if doc.UsersTotal != 1 || doc.UsersMain != 1 || doc.UsersOnlyElsewhere != 0 || doc.SnapshotsFlipping != 0 {
+		t.Fatalf("unexpected preview: %s", rec.Body.String())
+	}
+	// No main selected: 400.
+	if err := h.setSetting("main_cluster_id", ""); err != nil {
+		t.Fatal(err)
+	}
+	rec = httptest.NewRecorder()
+	h.AdminRolloutPreview(rec, httptest.NewRequest(http.MethodGet, "/admin/api/rollout-preview", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("no main: got %d, want 400", rec.Code)
+	}
+}
+
+func TestAdminPingAgent(t *testing.T) {
+	h := testHandler(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/health") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer srv.Close()
+	seedSyncClusterWithAgent(t, h, "id-a", "Alpha", srv.URL+"/a")
+	seedSyncClusterWithAgent(t, h, "id-b", "Beta", "http://127.0.0.1:1")
+	seedSyncCluster(t, h) // no agent URL.
+	ping := func(id string) (int, map[string]any) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/admin/api/clusters/"+id+"/ping", nil)
+		req = mux.SetURLVars(req, map[string]string{"id": id})
+		rec := httptest.NewRecorder()
+		h.AdminPingAgent(rec, req)
+		var doc map[string]any
+		_ = json.Unmarshal(rec.Body.Bytes(), &doc)
+		return rec.Code, doc
+	}
+	if code, doc := ping("id-a"); code != http.StatusOK || doc["ok"] != true || doc["latency_ms"] == nil {
+		t.Fatalf("healthy agent: %d %v", code, doc)
+	}
+	if code, doc := ping("id-b"); code != http.StatusOK || doc["ok"] != false {
+		t.Fatalf("dead agent must fail soft: %d %v", code, doc)
+	}
+	if code, _ := ping("11111111-2222-3333-4444-555555555555"); code != http.StatusBadRequest {
+		t.Fatalf("no agent URL: got %d, want 400", code)
+	}
+}
+
+func TestAdminSources(t *testing.T) {
+	h := testHandler(t)
+	seedSyncCluster(t, h)
+	rec, req := authedSyncReq(t, "POST", "/sync/push", pushPayload("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "2026-09-29T10:00:00Z"), syncTestKey)
+	h.SyncPush(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("push: %d", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	h.AdminSources(rec, httptest.NewRequest(http.MethodGet, "/admin/api/sources", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d", rec.Code)
+	}
+	var doc struct {
+		Sources []struct {
+			Cluster string `json:"cluster"`
+			Users   int    `json:"users"`
+		} `json:"sources"`
+		Total int `json:"total"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if doc.Total != 1 || len(doc.Sources) != 1 || doc.Sources[0].Cluster != "Sync Cluster" || doc.Sources[0].Users != 1 {
+		t.Fatalf("unexpected sources: %s", rec.Body.String())
+	}
+}
+
+func TestAdminUptimeVolumeGrowthErrors(t *testing.T) {
+	h := testHandler(t)
+	cid := seedSyncCluster(t, h)
+	now := time.Now().UTC()
+	recent := now.Add(-time.Hour).Format("2006-01-02 15:04:05")
+	if _, err := h.DB.Exec(`INSERT INTO heartbeat_events(cluster_id,time,event)
+		VALUES(?,?,'online'),(?,'2020-01-01 00:00:00','offline')`, cid, recent, cid); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.DB.Exec(`INSERT INTO sync_log(cluster_id,direction,endpoint,users,status,detail)
+		VALUES(?,'in','push',5,'ok',''),(?,'in','push',0,'denied','bad key')`, cid, cid); err != nil {
+		t.Fatal(err)
+	}
+	uid := "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	if _, err := h.DB.Exec(`INSERT INTO sync_users(user_id,username,email,created_at) VALUES(?,'eve','e@x.org',?)`,
+		uid, now.Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	get := func(path string) (int, map[string]any) {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		switch {
+		case strings.HasPrefix(path, "/admin/api/uptime"):
+			h.AdminUptime(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		case strings.HasPrefix(path, "/admin/api/sync-volume"):
+			h.AdminSyncVolume(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		case strings.HasPrefix(path, "/admin/api/growth"):
+			h.AdminGrowth(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		case strings.HasPrefix(path, "/admin/api/sync-errors"):
+			h.AdminSyncErrors(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		default:
+			t.Fatalf("unknown path %s", path)
+		}
+		var doc map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
+			t.Fatalf("%s: decode: %v", path, err)
+		}
+		return rec.Code, doc
+	}
+	if code, doc := get("/admin/api/uptime?range=24h"); code != http.StatusOK {
+		t.Fatalf("uptime: %d", code)
+	} else if cls, ok := doc["clusters"].([]any); !ok || len(cls) != 1 {
+		t.Fatalf("uptime clusters: %v", doc)
+	} else {
+		m := cls[0].(map[string]any)
+		// Offline since 2020, online for the last hour: a sliver of 24h, one flap.
+		if pct, _ := m["pct"].(float64); pct <= 0 || pct > 10 {
+			t.Fatalf("uptime pct = %v, want (0,10]", pct)
+		}
+		if flaps, _ := m["flaps"].(float64); flaps != 1 {
+			t.Fatalf("flaps = %v, want 1", flaps)
+		}
+	}
+	if code, doc := get("/admin/api/uptime?range=bogus"); code != http.StatusBadRequest {
+		t.Fatalf("bad range: got %d, want 400 (%v)", code, doc)
+	}
+	if code, doc := get("/admin/api/sync-volume?days=7"); code != http.StatusOK {
+		t.Fatalf("volume: %d", code)
+	} else if days, ok := doc["days"].([]any); !ok || len(days) != 7 {
+		t.Fatalf("volume days: %v", doc)
+	}
+	if code, doc := get("/admin/api/growth?days=7"); code != http.StatusOK {
+		t.Fatalf("growth: %d", code)
+	} else {
+		found := false
+		if days, ok := doc["days"].([]any); ok {
+			for _, d := range days {
+				if m, ok := d.(map[string]any); ok && m["total"] == float64(1) {
+					found = true
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("growth missing today's account: %v", doc)
+		}
+	}
+	if code, doc := get("/admin/api/sync-errors"); code != http.StatusOK {
+		t.Fatalf("errors: %d", code)
+	} else if doc["count"] != float64(1) {
+		t.Fatalf("error count = %v, want 1 (denied): %v", doc["count"], doc)
+	}
+}
+
+func TestAdminDuplicates(t *testing.T) {
+	h := testHandler(t)
+	for _, u := range []struct{ id, name, mail string }{
+		{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "amy", "amy@x.org"},
+		{"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "amy2", "amy@x.org"},
+		{"cccccccccccccccccccccccccccccccc", "amy", "other@x.org"},
+	} {
+		if _, err := h.DB.Exec(`INSERT INTO sync_users(user_id,username,email) VALUES(?,?,?)`,
+			u.id, u.name, u.mail); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rec := httptest.NewRecorder()
+	h.AdminDuplicates(rec, httptest.NewRequest(http.MethodGet, "/admin/api/duplicates", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d", rec.Code)
+	}
+	var doc struct {
+		Groups []struct {
+			Field string   `json:"field"`
+			Value string   `json:"value"`
+			IDs   []string `json:"ids"`
+		} `json:"groups"`
+		Count int `json:"count"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if doc.Count != 2 {
+		t.Fatalf("groups = %d, want 2 (email + username): %s", doc.Count, rec.Body.String())
+	}
+	for _, g := range doc.Groups {
+		if len(g.IDs) != 2 {
+			t.Fatalf("group %+v must hold 2 ids", g)
+		}
+	}
+}
+
+func TestAdminMotdExpiry(t *testing.T) {
+	h := testHandler(t)
+	id := registerTestCluster(t, h, "Expiring")
+	set := func(body string) int {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/admin/api/clusters/"+id+"/motd", strings.NewReader(body))
+		req = mux.SetURLVars(req, map[string]string{"id": id})
+		rec := httptest.NewRecorder()
+		h.AdminSetMOTD(rec, req)
+		return rec.Code
+	}
+	if code := set(`{"motd":"tonight","minutes":60}`); code != http.StatusOK {
+		t.Fatalf("motd with expiry: %d", code)
+	}
+	var motd, until string
+	if err := h.DB.QueryRow(`SELECT motd,motd_until FROM clusters WHERE id=?`, id).Scan(&motd, &until); err != nil || motd != "tonight" || until == "" {
+		t.Fatalf("motd stored: %q %q (err %v)", motd, until, err)
+	}
+	// Expired MOTD reads blank on the public list but stays stored.
+	if _, err := h.DB.Exec(`UPDATE clusters SET motd_until='2020-01-01T00:00:00Z' WHERE id=?`, id); err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	h.List(rec, httptest.NewRequest(http.MethodGet, "/clusters", nil))
+	var list struct {
+		Clusters []Cluster `json:"clusters"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(list.Clusters) != 1 || list.Clusters[0].MOTD != "" {
+		t.Fatalf("expired motd still shown: %+v", list.Clusters)
+	}
+	if code := set(`{"motd":"x","minutes":-1}`); code != http.StatusBadRequest {
+		t.Fatalf("negative minutes: got %d, want 400", code)
 	}
 }

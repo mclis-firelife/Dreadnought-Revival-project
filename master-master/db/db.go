@@ -90,6 +90,26 @@ var migrations = []string{
 		key   TEXT PRIMARY KEY,
 		value TEXT NOT NULL DEFAULT ''
 	)`,
+	// Temporary blocks: reason shown in the dashboard, optional expiry after
+	// which the cluster may list again without operator action. blocked=1
+	// with an empty until is indefinite (the old behaviour).
+	`ALTER TABLE clusters ADD COLUMN blocked_until TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE clusters ADD COLUMN blocked_reason TEXT NOT NULL DEFAULT ''`,
+	// Heartbeat transitions for the flap timeline: 'online' when a cluster
+	// returns, 'offline' when the sweeper marks it stale. Capped to 30 days
+	// by the same sweeper.
+	`CREATE TABLE IF NOT EXISTS heartbeat_events (
+		id         INTEGER PRIMARY KEY AUTOINCREMENT,
+		cluster_id TEXT NOT NULL DEFAULT '',
+		time       TEXT NOT NULL DEFAULT (datetime('now')),
+		event      TEXT NOT NULL DEFAULT ''
+	)`,
+	// Operator note per cluster (owner contact, maintenance window, quirks).
+	`ALTER TABLE clusters ADD COLUMN note TEXT NOT NULL DEFAULT ''`,
+	// When the sync secret was last (re)generated: rotation age display.
+	`ALTER TABLE clusters ADD COLUMN secret_set_at TEXT NOT NULL DEFAULT ''`,
+	// MOTD expiry: empty means permanent (the old behaviour).
+	`ALTER TABLE clusters ADD COLUMN motd_until TEXT NOT NULL DEFAULT ''`,
 }
 
 func Open(path string) (*sql.DB, error) {

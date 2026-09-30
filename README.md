@@ -478,7 +478,7 @@ in [Server browser](docs/server-browser.md), setup through go-live in the
 [runbook](docs/server-browser-testing.md).
 
 > **Live directory:** a master-master server is currently running and its
-> address (`http://91.51.31.83:8091`) is baked into the distributed browser
+> address (`http://93.211.96.9:8091`) is baked into the distributed browser
 > builds (`-X main.defaultDirectory=…`), so testers see clusters without
 > typing anything.
 

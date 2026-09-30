@@ -4318,7 +4318,17 @@ func clientOwnedItemIDs(playerPID string) []int32 {
 			primary: h.primary, secondary: h.secondary, abilities: h.abilities, perks: h.perks}
 	}
 	state := mmogPlayerStateForPID(playerPID)
-	for _, loadout := range ownedShipLoadoutsForPlayerData(state, playerPID) {
+	ownedLoadouts := ownedShipLoadoutsForPlayerData(state, playerPID)
+	// Owned HULLS, not just their fittings. A naturally registered player
+	// owns the starter hulls with no purchase row for them (seedMmogPlayer-
+	// State writes none), so the hull loadout id was in neither client list
+	// and every child hull's prerequisite walk failed: fully researched T1
+	// lines left T2 locked with padlocks. Owning is owning — the id goes in
+	// (no DB write; this list is composed per reply).
+	for _, loadout := range ownedLoadouts {
+		add(loadout.precastLoadoutID)
+	}
+	for _, loadout := range ownedLoadouts {
 		hull, ok := fittedByLoadout[loadout.precastLoadoutID]
 		if !ok {
 			continue

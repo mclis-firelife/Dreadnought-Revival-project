@@ -90,7 +90,7 @@ const browserPageHTML = `<!doctype html>
         <input id="dir-url" class="grow" placeholder="Directory address" spellcheck="false">
         <button class="link" onclick="setDirectory()">Use</button>
       </div>
-      <p class="note">use: http://91.51.31.83:8091</p>
+      <p class="note">use: http://93.211.96.9:8091</p>
       <div id="list" style="margin-top:12px;max-height:32vh;overflow:auto"></div>
       <div class="msg" id="dirmsg"></div>
       <h2 style="margin-top:18px">Add a server by hand</h2>

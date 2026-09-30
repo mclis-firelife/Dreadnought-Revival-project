@@ -403,6 +403,10 @@ func TestAdminSecretGenerateSendRevoke(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &gen); err != nil || len(gen.Secret) != 48 {
 		t.Fatalf("no usable secret back: %s", rec.Body.String())
 	}
+	var setAt string
+	if err := h.DB.QueryRow(`SELECT secret_set_at FROM clusters WHERE id=?`, id).Scan(&setAt); err != nil || setAt == "" {
+		t.Fatalf("secret_set_at missing: %q (err %v)", setAt, err)
+	}
 
 	// Send without an agent URL: refused, never downgraded to plaintext.
 	rec = secretReq(t, h, id, "send")
@@ -444,5 +448,214 @@ func TestAdminSecretRejectsGarbage(t *testing.T) {
 	id := registerTestCluster(t, h, "Action Cluster")
 	if rec := secretReq(t, h, id, "explode"); rec.Code != http.StatusBadRequest {
 		t.Errorf("bad action: got %d, want 400", rec.Code)
+	}
+}
+
+func blockReq(t *testing.T, h *Handler, id, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/clusters/"+id+"/block", strings.NewReader(body))
+	req = mux.SetURLVars(req, map[string]string{"id": id})
+	rec := httptest.NewRecorder()
+	h.AdminBlock(rec, req)
+	return rec
+}
+
+func registerBody(name string) string {
+	raw, _ := json.Marshal(map[string]any{
+		"name": name, "web_url": "https://play.example.org", "battle_ip": "203.0.113.7",
+		"version": "1.0", "contact_email": "owner@example.org",
+	})
+	return string(raw)
+}
+
+func TestAdminBlockTemporaryExpires(t *testing.T) {
+	h := testHandler(t)
+	id := registerTestCluster(t, h, "Tempblocked")
+
+	rec := blockReq(t, h, id, `{"reason":"maintenance window","minutes":60}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("block: %d %s", rec.Code, rec.Body.String())
+	}
+	var blocked struct {
+		Until string `json:"until"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &blocked); err != nil || blocked.Until == "" {
+		t.Fatalf("no expiry back: %s", rec.Body.String())
+	}
+
+	// Blocked: re-register refused with the reason, browser list hides it.
+	rec = httptest.NewRecorder()
+	h.Register(rec, httptest.NewRequest(http.MethodPost, "/clusters/register",
+		strings.NewReader(registerBody("Tempblocked"))))
+	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "maintenance window") {
+		t.Fatalf("register while blocked: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	h.List(rec, httptest.NewRequest(http.MethodGet, "/clusters", nil))
+	if strings.Contains(rec.Body.String(), "Tempblocked") {
+		t.Fatalf("blocked cluster listed: %s", rec.Body.String())
+	}
+
+	// Admin sees reason and expiry.
+	rec = httptest.NewRecorder()
+	h.AdminListAll(rec, httptest.NewRequest(http.MethodGet, "/admin/api/clusters", nil))
+	if !strings.Contains(rec.Body.String(), "maintenance window") || !strings.Contains(rec.Body.String(), blocked.Until) {
+		t.Fatalf("admin list hides block detail: %s", rec.Body.String())
+	}
+
+	// Elapse the block: registration works again, list shows it.
+	if _, err := h.DB.Exec(`UPDATE clusters SET blocked_until='2020-01-01T00:00:00Z' WHERE id=?`, id); err != nil {
+		t.Fatal(err)
+	}
+	rec = httptest.NewRecorder()
+	h.Register(rec, httptest.NewRequest(http.MethodPost, "/clusters/register",
+		strings.NewReader(registerBody("Tempblocked"))))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("register after expiry: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	h.List(rec, httptest.NewRequest(http.MethodGet, "/clusters", nil))
+	if !strings.Contains(rec.Body.String(), "Tempblocked") {
+		t.Fatalf("expired block still hides: %s", rec.Body.String())
+	}
+}
+
+func TestAdminBlockValidation(t *testing.T) {
+	h := testHandler(t)
+	id := registerTestCluster(t, h, "Validated")
+	if rec := blockReq(t, h, id, `{"minutes":-1}`); rec.Code != http.StatusBadRequest {
+		t.Errorf("negative minutes: got %d, want 400", rec.Code)
+	}
+	if rec := blockReq(t, h, id, `{"reason":"`+strings.Repeat("x", 201)+`"}`); rec.Code != http.StatusBadRequest {
+		t.Errorf("long reason: got %d, want 400", rec.Code)
+	}
+	if rec := blockReq(t, h, "00000000-0000-0000-0000-000000000000", `{}`); rec.Code != http.StatusNotFound {
+		t.Errorf("unknown cluster: got %d, want 404", rec.Code)
+	}
+	// Indefinite block (no body fields) still works, then unblock clears all.
+	if rec := blockReq(t, h, id, `{}`); rec.Code != http.StatusOK {
+		t.Fatalf("indefinite block: %d", rec.Code)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/clusters/"+id+"/unblock", nil)
+	req = mux.SetURLVars(req, map[string]string{"id": id})
+	rec := httptest.NewRecorder()
+	h.AdminUnblock(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unblock: %d", rec.Code)
+	}
+	var blocked int
+	var until, reason string
+	if err := h.DB.QueryRow(`SELECT blocked,blocked_until,blocked_reason FROM clusters WHERE id=?`,
+		id).Scan(&blocked, &until, &reason); err != nil || blocked != 0 || until != "" || reason != "" {
+		t.Fatalf("unblock residue: %d %q %q (err %v)", blocked, until, reason, err)
+	}
+}
+
+func TestAdminMotdAll(t *testing.T) {
+	h := testHandler(t)
+	registerTestCluster(t, h, "Motd One")
+	registerTestCluster(t, h, "Motd Two")
+	rec := httptest.NewRecorder()
+	h.AdminMotdAll(rec, httptest.NewRequest(http.MethodPost, "/admin/api/motd-all",
+		strings.NewReader(`{"motd":"maintenance tonight"}`)))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"updated":2`) {
+		t.Fatalf("motd-all: %d %s", rec.Code, rec.Body.String())
+	}
+	var n int
+	if err := h.DB.QueryRow(`SELECT COUNT(*) FROM clusters WHERE motd='maintenance tonight'`).Scan(&n); err != nil || n != 2 {
+		t.Fatalf("motd rows = %d (err %v)", n, err)
+	}
+	rec = httptest.NewRecorder()
+	h.AdminMotdAll(rec, httptest.NewRequest(http.MethodPost, "/admin/api/motd-all",
+		strings.NewReader(`{"motd":"`+strings.Repeat("x", 501)+`"}`)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("long motd: got %d, want 400", rec.Code)
+	}
+}
+
+func TestAdminNoteRoundtrip(t *testing.T) {
+	h := testHandler(t)
+	id := registerTestCluster(t, h, "Noted")
+	set := func(body string) int {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/admin/api/clusters/"+id+"/note", strings.NewReader(body))
+		req = mux.SetURLVars(req, map[string]string{"id": id})
+		rec := httptest.NewRecorder()
+		h.AdminSetNote(rec, req)
+		return rec.Code
+	}
+	if code := set(`{"note":"owner on holiday, back Monday"}`); code != http.StatusOK {
+		t.Fatalf("set note: %d", code)
+	}
+	rec := httptest.NewRecorder()
+	h.AdminListAll(rec, httptest.NewRequest(http.MethodGet, "/admin/api/clusters", nil))
+	if !strings.Contains(rec.Body.String(), "owner on holiday") {
+		t.Fatalf("note missing from admin list: %s", rec.Body.String())
+	}
+	if code := set(`{"note":"` + strings.Repeat("x", 501) + `"}`); code != http.StatusBadRequest {
+		t.Fatalf("long note: got %d, want 400", code)
+	}
+	if code := set(`{"note":""}`); code != http.StatusOK {
+		t.Fatalf("clear note: %d", code)
+	}
+}
+
+func TestHeartbeatHistoryRecordsTransitions(t *testing.T) {
+	h := testHandler(t)
+	id := registerTestCluster(t, h, "Flappy")
+	// Registration records the first online event.
+	var n int
+	if err := h.DB.QueryRow(`SELECT COUNT(*) FROM heartbeat_events WHERE cluster_id=? AND event='online'`, id).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("online events = %d (err %v), want 1", n, err)
+	}
+	// A repeat heartbeat is steady state: no new event.
+	hb := func() int {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/clusters/"+id+"/heartbeat", strings.NewReader(`{}`))
+		req = mux.SetURLVars(req, map[string]string{"id": id})
+		rec := httptest.NewRecorder()
+		h.Heartbeat(rec, req)
+		return rec.Code
+	}
+	if code := hb(); code != http.StatusOK {
+		t.Fatalf("heartbeat: %d", code)
+	}
+	if err := h.DB.QueryRow(`SELECT COUNT(*) FROM heartbeat_events WHERE cluster_id=?`, id).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("events after steady heartbeat = %d, want still 1", n)
+	}
+	// Offline interval then return: second online event.
+	if _, err := h.DB.Exec(`UPDATE clusters SET status='offline',last_heartbeat='2020-01-01T00:00:00Z' WHERE id=?`, id); err != nil {
+		t.Fatal(err)
+	}
+	if code := hb(); code != http.StatusOK {
+		t.Fatalf("return heartbeat: %d", code)
+	}
+	if err := h.DB.QueryRow(`SELECT COUNT(*) FROM heartbeat_events WHERE cluster_id=? AND event='online'`, id).Scan(&n); err != nil || n != 2 {
+		t.Fatalf("online events after return = %d, want 2", n)
+	}
+	// History endpoint serves them newest-first.
+	rec := httptest.NewRecorder()
+	h.AdminHeartbeatHistory(rec, httptest.NewRequest(http.MethodGet, "/admin/api/heartbeat-history?cluster="+id, nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "online") {
+		t.Fatalf("history: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAdminBackupDownloads(t *testing.T) {
+	h := testHandler(t)
+	registerTestCluster(t, h, "Backup Me")
+	rec := httptest.NewRecorder()
+	h.AdminBackup(rec, httptest.NewRequest(http.MethodGet, "/admin/api/backup", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("backup: %d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/octet-stream" {
+		t.Fatalf("content-type = %q", ct)
+	}
+	if cd := rec.Header().Get("Content-Disposition"); !strings.Contains(cd, "master-master-") || !strings.Contains(cd, ".db") {
+		t.Fatalf("content-disposition = %q", cd)
+	}
+	if rec.Body.Len() < 1024 {
+		t.Fatalf("backup suspiciously small: %d bytes", rec.Body.Len())
 	}
 }

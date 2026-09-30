@@ -74,6 +74,11 @@ func registerAdminDashboard(r *mux.Router, adminKey, controlPlaneURL, internalKe
 	api.HandleFunc("/reports", adminAPIReports).Methods(http.MethodGet)
 	api.HandleFunc("/logs", adminAPILogs).Methods(http.MethodGet)
 	api.HandleFunc("/battle-logs", adminAPIBattleLogs).Methods(http.MethodGet)
+	api.HandleFunc("/series", adminAPISeries).Methods(http.MethodGet)
+	api.HandleFunc("/sleepers", adminAPISleepers).Methods(http.MethodGet)
+	api.HandleFunc("/wealth", adminAPIWealth).Methods(http.MethodGet)
+	api.HandleFunc("/ships", adminAPIShips).Methods(http.MethodGet)
+	api.HandleFunc("/mode-stats", adminAPIModeStats).Methods(http.MethodGet)
 }
 
 func writeAdminJSON(w http.ResponseWriter, v any) {
@@ -444,6 +449,340 @@ func adminAPIReports(w http.ResponseWriter, _ *http.Request) {
 		}
 	}
 	writeAdminJSON(w, map[string]any{"reports": out})
+}
+
+// --- history series ---------------------------------------------------------
+
+// seriesSpecs maps a dashboard graph metric to its table, timestamp column
+// and value expression. All timestamp columns are datetime('now') text
+// ("2006-01-02 15:04:05" UTC), but rows written by tests or tools may carry
+// RFC3339 — parseSeriesTime accepts both, anything else is skipped.
+var seriesSpecs = map[string]struct {
+	table, timeCol, valExpr, where string
+}{
+	"matches":  {"matches", "created_at", "1", ""},
+	"results":  {"battle_results", "created_at", "1", ""},
+	"kills":    {"battle_results", "created_at", "COALESCE(kills,0)", ""},
+	"credits":  {"battle_results", "created_at", "COALESCE(credits,0)", ""},
+	"accounts": {"player_state", "created_at", "1", ""},
+	"reports":  {"client_reports", "created_at", "1", ""},
+	// Store turnover in credits (research grants and admin gifts carry
+	// other currencies and must not count as spending).
+	"spending": {"player_purchases", "purchased_at", "COALESCE(price_paid,0)", "currency='CR'"},
+}
+
+func parseSeriesTime(raw string) (time.Time, bool) {
+	for _, layout := range []string{"2006-01-02 15:04:05", time.RFC3339} {
+		if t, err := time.Parse(layout, strings.TrimSpace(raw)); err == nil {
+			return t.UTC(), true
+		}
+	}
+	return time.Time{}, false
+}
+
+// adminAPISeries serves bucketed history for dashboard graphs:
+// GET /admin/api/series?metric=matches&from=<RFC3339>&to=<RFC3339>&buckets=120
+// answers {metric, from, to, buckets, points:[[unix,value]...], total}.
+// from/to are optional (unbounded past / now). Filtering and bucketing
+// happen in Go — the tables are small (thousands of rows) and this way both
+// timestamp spellings count. Unknown metric is 400; a missing table answers
+// empty, never 500, so one absent table cannot kill every graph.
+func adminAPISeries(w http.ResponseWriter, r *http.Request) {
+	metric := strings.TrimSpace(r.URL.Query().Get("metric"))
+	spec, ok := seriesSpecs[metric]
+	if !ok {
+		http.Error(w, `{"error":"unknown metric"}`, http.StatusBadRequest)
+		return
+	}
+	var from, to time.Time
+	if raw := strings.TrimSpace(r.URL.Query().Get("from")); raw != "" {
+		t, ok := parseSeriesTime(raw)
+		if !ok {
+			http.Error(w, `{"error":"bad from timestamp"}`, http.StatusBadRequest)
+			return
+		}
+		from = t
+	}
+	if raw := strings.TrimSpace(r.URL.Query().Get("to")); raw != "" {
+		t, ok := parseSeriesTime(raw)
+		if !ok {
+			http.Error(w, `{"error":"bad to timestamp"}`, http.StatusBadRequest)
+			return
+		}
+		to = t
+	} else {
+		to = time.Now().UTC()
+	}
+	buckets := 120
+	if n, err := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("buckets"))); err == nil {
+		buckets = n
+	}
+	if buckets < 8 {
+		buckets = 8
+	}
+	if buckets > 240 {
+		buckets = 240
+	}
+	type point struct {
+		at  time.Time
+		val float64
+	}
+	var points []point
+	database := currentMmogPlayerStateDB()
+	if database != nil {
+		query := `SELECT ` + spec.timeCol + `,` + spec.valExpr + ` FROM ` + spec.table
+		if spec.where != "" {
+			query += ` WHERE ` + spec.where
+		}
+		rows, err := database.Query(query)
+		if err == nil {
+			for rows.Next() {
+				var rawT string
+				var v float64
+				if err := rows.Scan(&rawT, &v); err != nil {
+					continue
+				}
+				at, ok := parseSeriesTime(rawT)
+				if !ok {
+					continue
+				}
+				if !from.IsZero() && at.Before(from) {
+					continue
+				}
+				if at.After(to) {
+					continue
+				}
+				points = append(points, point{at: at, val: v})
+			}
+			_ = rows.Close()
+		}
+	}
+	// No lower bound given: start at the first point (history "since the
+	// database began"); empty table: a flat zero line over the last day so
+	// the graph renders instead of erroring.
+	start := from
+	if start.IsZero() {
+		start = to.Add(-24 * time.Hour)
+		for _, p := range points {
+			if p.at.Before(start) {
+				start = p.at
+			}
+		}
+	}
+	out := make([][2]any, buckets)
+	width := to.Sub(start)
+	if width <= 0 {
+		width = time.Second
+	}
+	sums := make([]float64, buckets)
+	var total float64
+	for _, p := range points {
+		i := int(p.at.Sub(start) * time.Duration(buckets) / width)
+		if i < 0 {
+			i = 0
+		}
+		if i >= buckets {
+			i = buckets - 1
+		}
+		sums[i] += p.val
+		total += p.val
+	}
+	for i := range out {
+		out[i] = [2]any{start.Add(time.Duration(i) * width / time.Duration(buckets)).Unix(), sums[i]}
+	}
+	writeAdminJSON(w, map[string]any{
+		"metric": metric, "from": start.UTC().Format(time.RFC3339),
+		"to":     to.UTC().Format(time.RFC3339), "buckets": buckets,
+		"points": out, "total": total,
+	})
+}
+
+// AdminAPISleepers handles GET /admin/api/sleepers?days=30 — accounts whose
+// last login is older than N days (or never logged in), most dormant first.
+// For win-back events and dead-account audits.
+func adminAPISleepers(w http.ResponseWriter, r *http.Request) {
+	days := 30
+	if raw := strings.TrimSpace(r.URL.Query().Get("days")); raw != "" {
+		var n int
+		if _, err := fmt.Sscanf(raw, "%d", &n); err == nil && n >= 1 && n <= 3650 {
+			days = n
+		}
+	}
+	database := currentMmogPlayerStateDB()
+	type row struct {
+		PID       string `json:"pid"`
+		Name      string `json:"name"`
+		Rank      int    `json:"rank"`
+		LastLogin string `json:"last_login"`
+	}
+	out := []row{}
+	if database != nil {
+		cutoff := time.Now().UTC().AddDate(0, 0, -days)
+		// Never-logged-in accounts fall back to created_at: a fresh account
+		// reads as recent (not dormant), an old untouched one as dormant.
+		rows, err := database.Query(`SELECT user_id,COALESCE(display_name,''),current_rank,
+			COALESCE(NULLIF(last_login_date,''),created_at) FROM player_state`)
+		if err == nil {
+			for rows.Next() {
+				var x row
+				var raw string
+				if err := rows.Scan(&x.PID, &x.Name, &x.Rank, &raw); err != nil {
+					continue
+				}
+				at, ok := parseSeriesTime(raw)
+				if !ok || at.After(cutoff) {
+					continue
+				}
+				x.LastLogin = raw
+				out = append(out, x)
+			}
+			_ = rows.Close()
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].LastLogin < out[j].LastLogin })
+	if len(out) > 100 {
+		out = out[:100]
+	}
+	writeAdminJSON(w, map[string]any{"sleepers": out, "count": len(out), "days": days})
+}
+
+// AdminAPIWealth handles GET /admin/api/wealth — soft-currency brackets:
+// how many pilots sit in each wealth band. For economy tuning.
+func adminAPIWealth(w http.ResponseWriter, r *http.Request) {
+	database := currentMmogPlayerStateDB()
+	bands := []struct {
+		label string
+		max   int64
+	}{
+		{"broke (<1k)", 1000},
+		{"1k–10k", 10000},
+		{"10k–50k", 50000},
+		{"50k–100k", 100000},
+		{"100k–500k", 500000},
+		{"500k–1M", 1000000},
+		{"whales (1M+)", 1 << 62},
+	}
+	counts := make([]int, len(bands))
+	total := 0
+	if database != nil {
+		rows, err := database.Query(`SELECT soft_currency FROM player_state`)
+		if err == nil {
+			for rows.Next() {
+				var v int64
+				if err := rows.Scan(&v); err != nil {
+					continue
+				}
+				total++
+				for i, b := range bands {
+					if v < b.max {
+						counts[i]++
+						break
+					}
+				}
+			}
+			_ = rows.Close()
+		}
+	}
+	type band struct {
+		Label string `json:"label"`
+		Count int    `json:"count"`
+	}
+	out := make([]band, len(bands))
+	for i, b := range bands {
+		out[i] = band{Label: b.label, Count: counts[i]}
+	}
+	writeAdminJSON(w, map[string]any{"bands": out, "total": total})
+}
+
+// AdminAPIShips handles GET /admin/api/ships — most-flown hulls by total
+// ship XP (the flown ledger), with pilot counts. Names resolve server-side
+// from the roster; unknown ids show the raw id.
+func adminAPIShips(w http.ResponseWriter, r *http.Request) {
+	database := currentMmogPlayerStateDB()
+	names := map[int32]string{}
+	for _, hull := range baseShipLoadouts {
+		names[hull.loadoutID] = hull.name
+	}
+	type ship struct {
+		ID     int32  `json:"id"`
+		Name   string `json:"name"`
+		XP     int64  `json:"xp"`
+		Pilots int    `json:"pilots"`
+	}
+	byID := map[int32]*ship{}
+	if database != nil {
+		rows, err := database.Query(`SELECT ship_id,COALESCE(SUM(xp),0),COUNT(DISTINCT user_id)
+			FROM player_ship_xp GROUP BY ship_id`)
+		if err == nil {
+			for rows.Next() {
+				var id int32
+				var xp int64
+				var pilots int
+				if err := rows.Scan(&id, &xp, &pilots); err != nil {
+					continue
+				}
+				name, ok := names[id]
+				if !ok {
+					name = fmt.Sprintf("ship %d", id)
+				}
+				byID[id] = &ship{ID: id, Name: name, XP: xp, Pilots: pilots}
+			}
+			_ = rows.Close()
+		}
+	}
+	out := []ship{}
+	for _, s := range byID {
+		out = append(out, *s)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].XP > out[j].XP })
+	if len(out) > 20 {
+		out = out[:20]
+	}
+	writeAdminJSON(w, map[string]any{"ships": out, "count": len(out)})
+}
+
+// AdminAPIModeStats handles GET /admin/api/mode-stats — matches, wins and
+// kills per game mode (matches joined to their reported results). For
+// balance reads: which modes are played, which are stomps.
+func adminAPIModeStats(w http.ResponseWriter, r *http.Request) {
+	database := currentMmogPlayerStateDB()
+	type mode struct {
+		Mode    string `json:"mode"`
+		Matches int    `json:"matches"`
+		Results int    `json:"results"`
+		Wins    int    `json:"wins"`
+		Kills   int    `json:"kills"`
+	}
+	byMode := map[string]*mode{}
+	if database != nil {
+		rows, err := database.Query(`SELECT m.game_mode,
+			COUNT(DISTINCT m.id),
+			COUNT(b.match_id),
+			COALESCE(SUM(CASE WHEN b.outcome='win' THEN 1 ELSE 0 END),0),
+			COALESCE(SUM(b.kills),0)
+			FROM matches m LEFT JOIN battle_results b
+			ON b.match_id=m.battle_match_id OR (m.battle_match_id!='' AND b.match_id LIKE m.battle_match_id||'-r%')
+			GROUP BY m.game_mode`)
+		if err == nil {
+			for rows.Next() {
+				var x mode
+				if err := rows.Scan(&x.Mode, &x.Matches, &x.Results, &x.Wins, &x.Kills); err != nil {
+					continue
+				}
+				if x.Mode == "" {
+					x.Mode = "(unset)"
+				}
+				byMode[x.Mode] = &x
+			}
+			_ = rows.Close()
+		}
+	}
+	out := []mode{}
+	for _, m := range byMode {
+		out = append(out, *m)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Matches > out[j].Matches })
+	writeAdminJSON(w, map[string]any{"modes": out, "count": len(out)})
 }
 
 // --- logs ---------------------------------------------------------------------

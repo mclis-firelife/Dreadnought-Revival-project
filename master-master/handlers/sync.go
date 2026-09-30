@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -651,6 +652,617 @@ func (h *Handler) AdminRollout(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"main": mainRes, "results": results, "count": len(results)})
 }
 
+// AdminSyncStatus handles GET /admin/api/syncstatus — one row per cluster:
+// secret set, agent URL, last push and pull (time + status from the audit
+// log), and how many mirrored accounts name it as source. The dashboard's
+// sync panel and cluster comparison read this.
+func (h *Handler) AdminSyncStatus(w http.ResponseWriter, r *http.Request) {
+	rows, err := h.DB.Query(`SELECT id,name,agent_url,secret_hash!='',secret_set_at,
+		COALESCE((SELECT COUNT(*) FROM sync_users WHERE source_cluster=clusters.name),0)
+		FROM clusters ORDER BY name`)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "db error")
+		return
+	}
+	defer func() { _ = rows.Close() }()
+	type status struct {
+		ID            string `json:"id"`
+		Name          string `json:"name"`
+		AgentURL      string `json:"agent_url"`
+		HasSecret     bool   `json:"has_secret"`
+		SecretSetAt   string `json:"secret_set_at"`
+		LastPush      string `json:"last_push"`
+		LastPushState string `json:"last_push_status"`
+		LastPull      string `json:"last_pull"`
+		LastPullState string `json:"last_pull_status"`
+		MirroredUsers int    `json:"mirrored_users"`
+	}
+	out := []status{}
+	last := func(clusterID, endpoint string) (string, string) {
+		var t, s string
+		_ = h.DB.QueryRow(`SELECT time,status FROM sync_log WHERE cluster_id=? AND endpoint=?
+			ORDER BY id DESC LIMIT 1`, clusterID, endpoint).Scan(&t, &s)
+		return t, s
+	}
+	// The store allows ONE connection: the rows above must be fully read
+	// (and closed) before the per-cluster lookups below, or the second
+	// query waits for a connection that never frees — hanging the handler
+	// forever (same lesson as mmogbrain's admin routes).
+	type idRow struct {
+		id, name, agentURL, secretSetAt string
+		hasSecret, mirrored             int
+	}
+	var ids []idRow
+	for rows.Next() {
+		var r idRow
+		if err := rows.Scan(&r.id, &r.name, &r.agentURL, &r.hasSecret, &r.secretSetAt, &r.mirrored); err != nil {
+			continue
+		}
+		ids = append(ids, r)
+	}
+	_ = rows.Close()
+	for _, r := range ids {
+		s := status{ID: r.id, Name: r.name, AgentURL: r.agentURL, SecretSetAt: r.secretSetAt, MirroredUsers: r.mirrored}
+		s.HasSecret = r.hasSecret != 0
+		s.LastPush, s.LastPushState = last(s.ID, "push")
+		s.LastPull, s.LastPullState = last(s.ID, "pull")
+		out = append(out, s)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"clusters": out, "count": len(out)})
+}
+
+// AdminPingAgent handles POST /admin/api/clusters/{id}/ping — is the
+// cluster's agent reachable right now? Plain GET on {agent_url}/health
+// (public, no secret involved), http and https both accepted like the sync
+// trigger. Answers {ok, latency_ms} or {ok:false, error}.
+func (h *Handler) AdminPingAgent(w http.ResponseWriter, r *http.Request) {
+	id := mux.Vars(r)["id"]
+	var agentURL string
+	if err := h.DB.QueryRow(`SELECT agent_url FROM clusters WHERE id=?`, id).Scan(&agentURL); err != nil {
+		writeError(w, http.StatusNotFound, "cluster not found")
+		return
+	}
+	agentURL = strings.TrimSpace(agentURL)
+	if agentURL == "" {
+		writeError(w, http.StatusBadRequest, "cluster has no agent URL")
+		return
+	}
+	target := strings.TrimRight(agentURL, "/") + "/health"
+	parsed, err := url.Parse(target)
+	if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
+		writeError(w, http.StatusBadRequest, "agent URL is not http(s)")
+		return
+	}
+	start := time.Now()
+	resp, err := agentHTTP().Get(target)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false,
+			"error": "agent answered HTTP " + resp.Status})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true,
+		"latency_ms": time.Since(start).Milliseconds()})
+}
+
+// AdminPresence handles GET /admin/api/presence — every account currently
+// reported mid-match anywhere (fresh window, like the launcher check but
+// without exclusions), with usernames and cluster names. The dashboard's
+// presence board polls this.
+func (h *Handler) AdminPresence(w http.ResponseWriter, r *http.Request) {
+	cutoff := time.Now().UTC().Add(-presenceWindow).Format(time.RFC3339)
+	rows, err := h.DB.Query(`SELECT p.user_id,COALESCE(u.username,''),p.cluster_id,
+		COALESCE(c.name,''),p.updated_at FROM sync_presence p
+		LEFT JOIN sync_users u ON u.user_id=p.user_id
+		LEFT JOIN clusters c ON c.id=p.cluster_id
+		WHERE p.in_match=1 AND p.updated_at>? ORDER BY p.updated_at DESC`, cutoff)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "db error")
+		return
+	}
+	defer func() { _ = rows.Close() }()
+	type entry struct {
+		UserID    string `json:"user_id"`
+		Username  string `json:"username"`
+		ClusterID string `json:"cluster_id"`
+		Cluster   string `json:"cluster"`
+		Since     string `json:"since"`
+	}
+	out := []entry{}
+	for rows.Next() {
+		var e entry
+		if err := rows.Scan(&e.UserID, &e.Username, &e.ClusterID, &e.Cluster, &e.Since); err != nil {
+			continue
+		}
+		if e.Cluster == "" {
+			e.Cluster = e.ClusterID
+		}
+		out = append(out, e)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"players": out, "count": len(out)})
+}
+
+// AdminRolloutPreview handles GET /admin/api/rollout-preview — what WOULD a
+// rollout from the main cluster change? Counts only, from the mirror: how
+// many accounts the main cluster sourced, how many snapshots currently come
+// from elsewhere (those flip), how many accounts exist only elsewhere (kept,
+// never deleted), and the per-source breakdown. No cluster is contacted.
+func (h *Handler) AdminRolloutPreview(w http.ResponseWriter, r *http.Request) {
+	mainID := h.getSetting("main_cluster_id")
+	if mainID == "" {
+		writeError(w, http.StatusBadRequest, "no main cluster selected")
+		return
+	}
+	var mainName string
+	if err := h.DB.QueryRow(`SELECT name FROM clusters WHERE id=?`, mainID).Scan(&mainName); err != nil {
+		writeError(w, http.StatusNotFound, "main cluster not found")
+		return
+	}
+	var usersTotal, usersMain, snapsElsewhere, bans int
+	_ = h.DB.QueryRow(`SELECT COUNT(*) FROM sync_users`).Scan(&usersTotal)
+	_ = h.DB.QueryRow(`SELECT COUNT(*) FROM sync_users WHERE source_cluster=?`, mainName).Scan(&usersMain)
+	_ = h.DB.QueryRow(`SELECT COUNT(*) FROM sync_snapshots WHERE source_cluster!=?`, mainName).Scan(&snapsElsewhere)
+	_ = h.DB.QueryRow(`SELECT COUNT(*) FROM sync_bans`).Scan(&bans)
+	type source struct {
+		Cluster string `json:"cluster"`
+		Users   int    `json:"users"`
+	}
+	sources := []source{}
+	if rows, err := h.DB.Query(`SELECT source_cluster,COUNT(*) FROM sync_users GROUP BY source_cluster ORDER BY 2 DESC`); err == nil {
+		for rows.Next() {
+			var s source
+			if err := rows.Scan(&s.Cluster, &s.Users); err == nil {
+				sources = append(sources, s)
+			}
+		}
+		_ = rows.Close()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"main": map[string]string{"id": mainID, "name": mainName},
+		"users_total": usersTotal, "users_main": usersMain,
+		"users_only_elsewhere": usersTotal - usersMain,
+		"snapshots_flipping":   snapsElsewhere, "bans": bans,
+		"sources": sources,
+	})
+}
+
+// AdminHeartbeatHistory handles GET /admin/api/heartbeat-history — flap
+// timeline: online/offline transitions, newest first. ?cluster=<id> filters
+// to one cluster. Limit default 100, max 500.
+func (h *Handler) AdminHeartbeatHistory(w http.ResponseWriter, r *http.Request) {
+	limit := 100
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		var n int
+		if _, err := fmt.Sscanf(raw, "%d", &n); err == nil {
+			limit = n
+		}
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	cluster := strings.TrimSpace(r.URL.Query().Get("cluster"))
+	query := `SELECT e.cluster_id,COALESCE(c.name,''),e.time,e.event FROM heartbeat_events e
+		LEFT JOIN clusters c ON c.id=e.cluster_id`
+	var args []any
+	if cluster != "" {
+		query += ` WHERE e.cluster_id=?`
+		args = append(args, cluster)
+	}
+	query += ` ORDER BY e.id DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := h.DB.Query(query, args...)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "db error")
+		return
+	}
+	defer func() { _ = rows.Close() }()
+	type entry struct {
+		ClusterID string `json:"cluster_id"`
+		Cluster   string `json:"cluster"`
+		Time      string `json:"time"`
+		Event     string `json:"event"`
+	}
+	out := []entry{}
+	for rows.Next() {
+		var e entry
+		if err := rows.Scan(&e.ClusterID, &e.Cluster, &e.Time, &e.Event); err != nil {
+			continue
+		}
+		if e.Cluster == "" {
+			e.Cluster = e.ClusterID
+		}
+		out = append(out, e)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"events": out, "count": len(out)})
+}
+
+// AdminSources handles GET /admin/api/sources — mirrored accounts grouped
+// by source cluster, for the contribution chart. No cluster contact.
+func (h *Handler) AdminSources(w http.ResponseWriter, r *http.Request) {
+	type source struct {
+		Cluster string `json:"cluster"`
+		Users   int    `json:"users"`
+	}
+	sources := []source{}
+	var total int
+	if rows, err := h.DB.Query(`SELECT source_cluster,COUNT(*) FROM sync_users GROUP BY source_cluster ORDER BY 2 DESC`); err == nil {
+		for rows.Next() {
+			var s source
+			if err := rows.Scan(&s.Cluster, &s.Users); err == nil {
+				sources = append(sources, s)
+				total += s.Users
+			}
+		}
+		_ = rows.Close()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"sources": sources, "total": total})
+}
+
+// AdminBackup handles GET /admin/api/backup — consistent snapshot of the
+// directory database as a download (VACUUM INTO a temp file, served, then
+// removed). Name carries the date.
+func (h *Handler) AdminBackup(w http.ResponseWriter, r *http.Request) {
+	tmp, err := os.CreateTemp("", "master-master-backup-*.db")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "cannot stage backup")
+		return
+	}
+	tmpPath := tmp.Name()
+	_ = tmp.Close()
+	defer func() { _ = os.Remove(tmpPath) }()
+	if _, err := h.DB.Exec(`VACUUM INTO '` + strings.ReplaceAll(tmpPath, `'`, `''`) + `'`); err != nil {
+		h.Log.WithError(err).Error("directory backup failed")
+		writeError(w, http.StatusInternalServerError, "backup failed")
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", `attachment; filename="master-master-`+
+		time.Now().UTC().Format("20060102-150405")+`.db"`)
+	http.ServeFile(w, r, tmpPath)
+}
+
+// AdminUptime handles GET /admin/api/uptime?range=24h — online percent per
+// cluster over the range, rebuilt from heartbeat transitions: state between
+// events holds, buckets count online share. Ranges like the dashboard
+// (2m 1h 24h 7d 14d 30d all; default 24h). Also returns flap counts.
+func (h *Handler) AdminUptime(w http.ResponseWriter, r *http.Request) {
+	to := time.Now().UTC()
+	from := to.Add(-24 * time.Hour)
+	if rng := strings.TrimSpace(r.URL.Query().Get("range")); rng != "" && rng != "all" {
+		d, ok := map[string]time.Duration{
+			"2m": 2 * time.Minute, "1h": time.Hour, "24h": 24 * time.Hour,
+			"7d": 7 * 24 * time.Hour, "14d": 14 * 24 * time.Hour,
+			"30d": 30 * 24 * time.Hour,
+		}[rng]
+		if !ok {
+			writeError(w, http.StatusBadRequest, "unknown range")
+			return
+		}
+		from = to.Add(-d)
+	} else if rng == "all" {
+		from = time.Time{}
+	}
+	type cluster struct {
+		ID, Name string
+		Online   bool
+	}
+	var clusters []cluster
+	if rows, err := h.DB.Query(`SELECT id,name,status FROM clusters ORDER BY name`); err == nil {
+		for rows.Next() {
+			var c cluster
+			var st string
+			if err := rows.Scan(&c.ID, &c.Name, &st); err == nil {
+				c.Online = st == "online"
+				clusters = append(clusters, c)
+			}
+		}
+		_ = rows.Close()
+	}
+	const buckets = 48
+	type series struct {
+		Name   string    `json:"name"`
+		Online bool      `json:"online_now"`
+		Pct    float64   `json:"pct"`
+		Flaps  int       `json:"flaps"`
+		Points []float64 `json:"points"`
+	}
+	out := []series{}
+	for _, c := range clusters {
+		// Events in window, oldest first, plus the last state before it.
+		type ev struct {
+			at  time.Time
+			on  bool
+		}
+		var events []ev
+		if rows, err := h.DB.Query(`SELECT time,event FROM heartbeat_events
+			WHERE cluster_id=? AND datetime(time)>=datetime(?) ORDER BY time`,
+			c.ID, from.UTC().Format("2006-01-02 15:04:05")); err == nil {
+			for rows.Next() {
+				var raw, kind string
+				if err := rows.Scan(&raw, &kind); err != nil {
+					continue
+				}
+				at, err := time.Parse("2006-01-02 15:04:05", raw)
+				if err != nil {
+					if at2, err2 := time.Parse(time.RFC3339, raw); err2 == nil {
+						at = at2
+					} else {
+						continue
+					}
+				}
+				events = append(events, ev{at: at.UTC(), on: kind == "online"})
+			}
+			_ = rows.Close()
+		}
+		start := from
+		if start.IsZero() {
+			if len(events) > 0 {
+				start = events[0].at
+			} else {
+				start = to.Add(-24 * time.Hour)
+			}
+		}
+		// State at window start: last event before it, else current status
+		// (a cluster online now with no events was online throughout).
+		state := c.Online
+		var lastRaw, lastKind string
+		_ = h.DB.QueryRow(`SELECT time,event FROM heartbeat_events WHERE cluster_id=?
+			AND datetime(time)<datetime(?) ORDER BY time DESC LIMIT 1`,
+			c.ID, start.UTC().Format("2006-01-02 15:04:05")).Scan(&lastRaw, &lastKind)
+		if lastKind != "" {
+			state = lastKind == "online"
+		}
+		span := to.Sub(start)
+		if span <= 0 {
+			span = time.Second
+		}
+		online := make([]float64, buckets)
+		flaps := 0
+		prev := state
+		ei := 0
+		for i := 0; i < buckets; i++ {
+			b1 := start.Add(time.Duration(i+1) * span / buckets)
+			cur := prev
+			for ei < len(events) && !events[ei].at.After(b1) {
+				cur = events[ei].on
+				ei++
+			}
+			if cur != prev {
+				flaps++
+				prev = cur
+			}
+			if cur {
+				online[i] = 100
+			}
+		}
+		pct := 0.0
+		for _, v := range online {
+			pct += v
+		}
+		pct /= buckets
+		out = append(out, series{Name: c.Name, Online: c.Online, Pct: pct, Flaps: flaps, Points: online})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"clusters": out, "count": len(out)})
+}
+
+// AdminSyncVolume handles GET /admin/api/sync-volume?days=14 — push/pull
+// traffic per day from the audit log: calls, users moved, denials. For the
+// volume chart.
+func (h *Handler) AdminSyncVolume(w http.ResponseWriter, r *http.Request) {
+	days := 14
+	if raw := strings.TrimSpace(r.URL.Query().Get("days")); raw != "" {
+		var n int
+		if _, err := fmt.Sscanf(raw, "%d", &n); err == nil && n >= 1 && n <= 90 {
+			days = n
+		}
+	}
+	type day struct {
+		Day       string `json:"day"`
+		PushCalls int    `json:"push_calls"`
+		PushUsers int    `json:"push_users"`
+		PullCalls int    `json:"pull_calls"`
+		PullUsers int    `json:"pull_users"`
+		Denied    int    `json:"denied"`
+	}
+	byDay := map[string]*day{}
+	rows, err := h.DB.Query(`SELECT substr(time,1,10),endpoint,direction,status,users FROM sync_log
+		WHERE datetime(time)>=datetime('now','-` + strconv.Itoa(days) + ` days')`)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "db error")
+		return
+	}
+	for rows.Next() {
+		var d, endpoint, direction, status string
+		var users int
+		if err := rows.Scan(&d, &endpoint, &direction, &status, &users); err != nil {
+			continue
+		}
+		e := byDay[d]
+		if e == nil {
+			e = &day{Day: d}
+			byDay[d] = e
+		}
+		switch {
+		case status == "denied":
+			e.Denied++
+		case endpoint == "push":
+			e.PushCalls++
+			e.PushUsers += users
+		case endpoint == "pull":
+			e.PullCalls++
+			e.PullUsers += users
+		}
+	}
+	_ = rows.Close()
+	out := []day{}
+	for i := days - 1; i >= 0; i-- {
+		key := time.Now().UTC().AddDate(0, 0, -i).Format("2006-01-02")
+		if e, ok := byDay[key]; ok {
+			out = append(out, *e)
+		} else {
+			out = append(out, day{Day: key})
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"days": out})
+}
+
+// AdminGrowth handles GET /admin/api/growth?days=30 — new mirrored accounts
+// per day (total + top sources), from sync_users.created_at.
+func (h *Handler) AdminGrowth(w http.ResponseWriter, r *http.Request) {
+	days := 30
+	if raw := strings.TrimSpace(r.URL.Query().Get("days")); raw != "" {
+		var n int
+		if _, err := fmt.Sscanf(raw, "%d", &n); err == nil && n >= 1 && n <= 365 {
+			days = n
+		}
+	}
+	type day struct {
+		Day     string         `json:"day"`
+		Total   int            `json:"total"`
+		Sources map[string]int `json:"sources"`
+	}
+	byDay := map[string]*day{}
+	rows, err := h.DB.Query(`SELECT created_at,source_cluster FROM sync_users`)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "db error")
+		return
+	}
+	cutoff := time.Now().UTC().AddDate(0, 0, -days)
+	for rows.Next() {
+		var raw, src string
+		if err := rows.Scan(&raw, &src); err != nil {
+			continue
+		}
+		raw = strings.TrimSpace(raw)
+		t, err := time.Parse("2006-01-02 15:04:05", raw)
+		if err != nil {
+			if t2, err2 := time.Parse(time.RFC3339, raw); err2 == nil {
+				t = t2
+			} else {
+				continue
+			}
+		}
+		t = t.UTC()
+		if t.Before(cutoff) {
+			continue
+		}
+		key := t.Format("2006-01-02")
+		e := byDay[key]
+		if e == nil {
+			e = &day{Day: key, Sources: map[string]int{}}
+			byDay[key] = e
+		}
+		e.Total++
+		e.Sources[src]++
+	}
+	_ = rows.Close()
+	out := []day{}
+	for i := days - 1; i >= 0; i-- {
+		key := time.Now().UTC().AddDate(0, 0, -i).Format("2006-01-02")
+		if e, ok := byDay[key]; ok {
+			out = append(out, *e)
+		} else {
+			out = append(out, day{Day: key, Sources: map[string]int{}})
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"days": out})
+}
+
+// AdminSyncErrors handles GET /admin/api/sync-errors?limit=50 — denied and
+// failed sync traffic, newest first: who, which endpoint, why.
+func (h *Handler) AdminSyncErrors(w http.ResponseWriter, r *http.Request) {
+	limit := 50
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		var n int
+		if _, err := fmt.Sscanf(raw, "%d", &n); err == nil && n >= 1 && n <= 500 {
+			limit = n
+		}
+	}
+	rows, err := h.DB.Query(`SELECT l.time,COALESCE(c.name,''),l.cluster_id,l.direction,l.endpoint,
+		l.status,l.detail FROM sync_log l LEFT JOIN clusters c ON c.id=l.cluster_id
+		WHERE l.status IN ('denied','error') ORDER BY l.id DESC LIMIT ?`, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "db error")
+		return
+	}
+	defer func() { _ = rows.Close() }()
+	type entry struct {
+		Time      string `json:"time"`
+		Cluster   string `json:"cluster"`
+		ClusterID string `json:"cluster_id"`
+		Direction string `json:"direction"`
+		Endpoint  string `json:"endpoint"`
+		Status    string `json:"status"`
+		Detail    string `json:"detail"`
+	}
+	out := []entry{}
+	for rows.Next() {
+		var e entry
+		if err := rows.Scan(&e.Time, &e.Cluster, &e.ClusterID, &e.Direction, &e.Endpoint,
+			&e.Status, &e.Detail); err != nil {
+			continue
+		}
+		if e.Cluster == "" {
+			e.Cluster = e.ClusterID
+		}
+		out = append(out, e)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"errors": out, "count": len(out)})
+}
+
+// AdminDuplicates handles GET /admin/api/duplicates — accounts sharing an
+// email or callsign under different ids (double registrations from the sync
+// window). Each group lists its ids for the operator to reconcile by hand;
+// the agent keeps the local row and skips the rest on apply.
+func (h *Handler) AdminDuplicates(w http.ResponseWriter, r *http.Request) {
+	type group struct {
+		Field string   `json:"field"`
+		Value string   `json:"value"`
+		IDs   []string `json:"ids"`
+		Names []string `json:"names"`
+	}
+	out := []group{}
+	for _, field := range []string{"email", "username"} {
+		rows, err := h.DB.Query(`SELECT ` + field + ` FROM sync_users
+			WHERE ` + field + `!='' GROUP BY ` + field + ` HAVING COUNT(DISTINCT user_id)>1`)
+		if err != nil {
+			continue
+		}
+		var values []string
+		for rows.Next() {
+			var v string
+			if err := rows.Scan(&v); err == nil {
+				values = append(values, v)
+			}
+		}
+		_ = rows.Close()
+		for _, v := range values {
+			urows, err := h.DB.Query(`SELECT user_id,username FROM sync_users WHERE `+field+`=? ORDER BY user_id`, v)
+			if err != nil {
+				continue
+			}
+			g := group{Field: field, Value: v}
+			for urows.Next() {
+				var id, name string
+				if err := urows.Scan(&id, &name); err == nil {
+					g.IDs = append(g.IDs, id)
+					g.Names = append(g.Names, name)
+				}
+			}
+			_ = urows.Close()
+			out = append(out, g)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"groups": out, "count": len(out)})
+}
+
 // AdminSyncLog handles GET /admin/api/synclog?limit= — the audit trail of
 // every sync communication, newest first.
 func (h *Handler) AdminSyncLog(w http.ResponseWriter, r *http.Request) {
@@ -784,7 +1396,7 @@ func (h *Handler) AdminSecret(w http.ResponseWriter, r *http.Request) {
 	}
 	switch req.Action {
 	case "revoke":
-		if _, err := h.DB.Exec(`UPDATE clusters SET secret_hash='' WHERE id=?`, id); err != nil {
+		if _, err := h.DB.Exec(`UPDATE clusters SET secret_hash='',secret_set_at='' WHERE id=?`, id); err != nil {
 			writeError(w, http.StatusInternalServerError, "db error")
 			return
 		}
@@ -803,7 +1415,8 @@ func (h *Handler) AdminSecret(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	secret := hex.EncodeToString(raw)
-	if _, err := h.DB.Exec(`UPDATE clusters SET secret_hash=? WHERE id=?`, secretHash(secret), id); err != nil {
+	if _, err := h.DB.Exec(`UPDATE clusters SET secret_hash=?,secret_set_at=? WHERE id=?`,
+		secretHash(secret), time.Now().UTC().Format(time.RFC3339), id); err != nil {
 		writeError(w, http.StatusInternalServerError, "db error")
 		return
 	}

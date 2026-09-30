@@ -13,6 +13,8 @@ const state = {
   lastUp: null,
   currentTab: "overview",
   logTimer: null,
+  range: "all",
+  seriesTimer: null,
 };
 
 async function api(path, opts = {}) {
@@ -61,9 +63,9 @@ function switchTab(name) {
   state.currentTab = name;
   document.querySelectorAll("#tabs button").forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
   document.querySelectorAll(".tab").forEach((s) => s.classList.toggle("active", s.id === "tab-" + name));
-  if (name === "players") { loadPlayers(); loadBans(); loadSessions(); }
+  if (name === "players") { loadPlayers(); loadBans(); loadSessions(); loadSleepers(); loadWealth(); }
   if (name === "queue") loadQueue();
-  if (name === "matches") { loadInstances(); loadResults(); loadMatchesList(); loadHistory(); }
+  if (name === "matches") { loadInstances(); loadResults(); loadMatchesList(); loadHistory(); loadHeatmap(); loadShips(); loadModeStats(); }
   if (name === "market") loadCatalog();
   if (name === "audit") loadAudit();
   if (name === "online") loadOnline();
@@ -74,7 +76,9 @@ function switchTab(name) {
   if (name === "logs") initLogs();
   if (name === "metrics") loadMetrics();
   if (name === "config") loadConfig();
-  if (name === "overview") loadStatus();
+  if (name === "reports") loadReports();
+  if (name === "setup") { loadSetup(); loadSecrets(); }
+  if (name === "overview") { loadStatus(); loadSeries(); loadTopKillers(); loadEconomyAndSessions(); }
 }
 
 /* ---------- overview ---------- */
@@ -95,6 +99,25 @@ async function loadStatus() {
   $("hero-instances").textContent = data.instances;
   $("hero-servers").textContent = data.servers;
   $("hero-online").textContent = data.online;
+
+  // History extras (mmogbrain admin overview, best-effort: blank on old builds).
+  if (data.accounts != null) {
+    $("tile-accounts").textContent = data.accounts;
+    const day = data.new_accounts_24h || 0;
+    $("tile-accounts-sub").textContent = `registered · +${day} / 24h`;
+  }
+  if (data.uptime_seconds != null) $("tile-uptime").textContent = fmtUptime(data.uptime_seconds);
+  const crashes = data.host_crashes_recent || {};
+  if (data.host_crashes_recent) {
+    $("tile-crash-stack").textContent = crashes["stack overflow"] || 0;
+    $("tile-crash-av").textContent = crashes["access violation"] || 0;
+    $("tile-crash-clean").textContent = crashes["clean"] || 0;
+  }
+  const modes = data.modes_24h || {};
+  const mkeys = Object.keys(modes);
+  $("modes-row").textContent = mkeys.length
+    ? "Modes / 24h: " + mkeys.map((k) => `${k} ×${modes[k]}`).join(" · ")
+    : "No matches in the last 24h.";
 
   const grid = $("service-grid");
   grid.innerHTML = "";
@@ -172,6 +195,105 @@ function drawHistory(canvas, hist) {
   }
 }
 
+/* ---------- overview graphs (tile backgrounds) ---------- */
+const RANGE_LABELS = { "2m": "2 min", "1h": "1 hour", "24h": "24 hours", "7d": "7 days", "14d": "14 days", "30d": "30 days", "1y": "1 year", "all": "all time" };
+// Tile id -> series metric. Gauge tiles keep their live value from loadStatus;
+// the series only draws the background line. Counter tiles take value+line.
+const TILE_SERIES = {
+  "spark-queue": "queued", "spark-matches": "matches", "spark-instances": "instances",
+  "spark-servers": "servers", "spark-online": "online", "spark-accounts": "accounts",
+  "spark-matches-total": "matches_total", "spark-kills": "kills",
+  "spark-credits": "credits", "spark-reports": "reports",
+};
+const TILE_VALUE = {
+  "matches_total": "tile-matches", "kills": "tile-kills", "credits": "tile-credits",
+  "reports": "tile-reports", "accounts": "tile-accounts",
+};
+const SPARK_COLORS = {
+  queued: "#6ea8fe", matches: "#34d399", instances: "#a06bff", servers: "#22d3ee",
+  online: "#34d399", accounts: "#6ea8fe", matches_total: "#34d399", kills: "#f87171",
+  credits: "#fbbf24", reports: "#a06bff",
+};
+
+function fmtNum(v) {
+  if (v == null || isNaN(v)) return "–";
+  v = Math.round(v);
+  return v >= 1000000 ? (v / 1000000).toFixed(1) + "M" : v >= 10000 ? (v / 1000).toFixed(1) + "k" : String(v);
+}
+
+function fmtUptime(s) {
+  if (s == null) return "–";
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+  return d > 0 ? `${d}d ${h}h` : h > 0 ? `${h}h ${m}m` : `${m}m`;
+}
+
+async function loadSeries() {
+  const metrics = [...new Set(Object.values(TILE_SERIES))].join(",");
+  let data;
+  try {
+    data = await api(`/api/series?metrics=${encodeURIComponent(metrics)}&range=${encodeURIComponent(state.range)}`);
+  } catch (e) { return; }
+  await loadMarkers();
+  const series = data.series || {};
+  for (const [svgId, metric] of Object.entries(TILE_SERIES)) {
+    const s = series[metric];
+    if (!s) continue;
+    drawSpark($(svgId), s.points, SPARK_COLORS[metric] || "#6ea8fe", markerCache, data.from, data.to);
+    const valueId = TILE_VALUE[metric];
+    if (valueId) $(valueId).textContent = fmtNum(s.total);
+  }
+  const note = $("recorded-note");
+  if (data.recorded_since) {
+    const since = new Date(data.recorded_since);
+    note.textContent = `gauge lines recorded since ${since.toLocaleString()} · counters since database began`;
+  } else {
+    note.textContent = "no gauge samples yet — collecting (one per minute)";
+  }
+  loadSLA();
+}
+
+async function loadSLA() {
+  try {
+    const data = await api(`/api/sla?range=${encodeURIComponent(state.range)}`);
+    const box = $("sla-box");
+    const names = Object.keys(data.services || {});
+    if (!names.length) {
+      box.innerHTML = '<p class="muted">No samples in range yet — collecting (one per minute).</p>';
+    } else {
+      box.innerHTML = "<dl>" + names.sort().map((n) => {
+        const p = data.services[n];
+        const cls = p >= 99 ? "ok" : p >= 95 ? "warn" : "bad";
+        return `<dt>${esc(n)}</dt><dd><span class="badge ${cls}">${p.toFixed(1)}%</span> <span class="muted-sm">${data.samples} samples</span></dd>`;
+      }).join("") + "</dl>";
+    }
+    $("sla-note").textContent = `range: ${state.range} · ${data.samples || 0} samples` +
+      (data.recorded_since ? ` · since ${new Date(data.recorded_since).toLocaleString()}` : "");
+  } catch (e) { /* services card stays useful without it */ }
+}
+
+function setRange(r) {
+  state.range = r;
+  document.querySelectorAll("#rangebar button").forEach((b) => b.classList.toggle("active", b.dataset.range === r));
+  loadSeries();
+}
+
+async function loadTopKillers() {
+  try {
+    const data = await api("/api/accounts");
+    const list = (data.accounts || []).filter((a) => a.has_player_data && (a.kills || 0) > 0);
+    list.sort((a, b) => (b.kills || 0) - (a.kills || 0));
+    const tb = tbodyFor("top-table");
+    tb.innerHTML = "";
+    list.slice(0, 5).forEach((a, i) => {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td>${i + 1}</td><td>${esc(a.username) || "–"}</td>
+        <td>${esc(a.kills)}</td><td>${esc(a.wins)}</td><td>${esc(a.matches)}</td>`;
+      tb.appendChild(tr);
+    });
+    if (!list.length) tb.innerHTML = '<tr><td colspan="5" class="muted">No kills recorded yet.</td></tr>';
+  } catch (e) { /* overview stays useful without it */ }
+}
+
 /* ---------- players (every registered account) ---------- */
 let accountsCache = [];
 async function loadPlayers() {
@@ -197,7 +319,8 @@ function renderPlayers() {
     tr.innerHTML = `<td>${esc(a.username) || "–"}</td><td>${esc(a.email) || "–"}</td>
       <td>${a.player_id ? `<code>${esc(a.player_id)}</code>` : '<span class="muted">–</span>'}</td>
       <td>${esc(a.credits)}</td><td>${esc(a.premium)}</td><td>${esc(a.free_xp)}</td>
-      <td>${a.has_player_data ? esc(a.rank) : "–"}</td><td>${status}</td><td class="row"></td>`;
+      <td>${a.has_player_data ? esc(a.rank) : "–"}</td><td>${esc(a.ships)}</td><td>${esc(a.matches)}</td><td>${esc(a.wins)}</td><td>${esc(a.kills)}</td>
+      <td>${status}</td><td class="row"></td>`;
     const cell = tr.lastChild;
     if (a.player_id) {
       const d = document.createElement("button");
@@ -245,6 +368,182 @@ async function doGrantAll() {
   });
 }
 
+/* ---------- client reports (in-game bug reports) ---------- */
+let reportsNameCache = null;
+async function loadReports() {
+  try {
+    const data = await api("/api/reports");
+    const list = data.reports || [];
+    $("reports-count").textContent = list.length + " reports";
+    if (!reportsNameCache) {
+      try {
+        const acc = await api("/api/accounts");
+        reportsNameCache = {};
+        for (const a of (acc.accounts || [])) {
+          if (a.player_id && a.username) reportsNameCache[String(a.player_id).toLowerCase()] = a.username;
+        }
+      } catch (e) { reportsNameCache = {}; }
+    }
+    const tb = tbodyFor("reports-table");
+    tb.innerHTML = "";
+    for (const r of list) {
+      const who = reportsNameCache[String(r.player || "").toLowerCase()] || r.player;
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td>${esc(r.id)}</td><td>${esc(r.when)}</td><td><code>${esc(who)}</code></td>
+        <td>${esc(r.type)}</td><td>${esc(r.name)}</td><td>${esc(r.details)}</td>`;
+      tb.appendChild(tr);
+    }
+    if (!list.length) tb.innerHTML = '<tr><td colspan="6" class="muted">No client reports yet.</td></tr>';
+  } catch (e) { toast("Reports: " + e.message, "err"); }
+}
+
+/* ---------- activity heatmap + queue ETA (from the match archive) ---------- */
+function parseHistTime(s) {
+  if (!s) return null;
+  const t = new Date(String(s).replace(" ", "T"));
+  return isNaN(t) ? null : t;
+}
+
+async function heatmapData() {
+  // Richer than the 30-row table: up to 500 recent matches for the grid.
+  try {
+    const data = await api("/api/history?limit=500");
+    return data.matches || [];
+  } catch (e) { return state.historyData || []; }
+}
+
+async function loadHeatmap() {
+  const list = await heatmapData();
+  const grid = Array.from({ length: 7 }, () => Array(24).fill(0));
+  let max = 0;
+  for (const m of list) {
+    const t = parseHistTime(m.started_at);
+    if (!t) continue;
+    grid[(t.getDay() + 6) % 7][t.getHours()]++;
+    if (grid[(t.getDay() + 6) % 7][t.getHours()] > max) max = grid[(t.getDay() + 6) % 7][t.getHours()];
+  }
+  const days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+  const tbl = $("heatmap-table");
+  let html = "<thead><tr><th></th>" + Array.from({ length: 24 }, (_, h) => `<th>${h}</th>`).join("") + "</tr></thead><tbody>";
+  grid.forEach((row, d) => {
+    html += `<tr><th>${days[d]}</th>` + row.map((v) => {
+      const a = max ? (v / max).toFixed(2) : 0;
+      return `<td style="background:rgba(110,168,254,${a})" title="${v} matches">${v || ""}</td>`;
+    }).join("") + "</tr>";
+  });
+  tbl.innerHTML = html + "</tbody>";
+  updateQueueETA(list);
+}
+
+// Estimated wait from archive pace: median gap between recent match starts,
+// scaled by queue length over median match size. A rough pace estimate, not
+// a promise — autoscale, modes and tiers all move it.
+function updateQueueETA(matches) {
+  const el = $("queue-eta");
+  try {
+    const times = (matches || []).map((m) => parseHistTime(m.started_at)).filter(Boolean)
+      .sort((a, b) => a - b).slice(-20);
+    const q = (state.lastQueue || []).length;
+    if (q === 0) { el.textContent = "Estimated wait: nobody waiting."; return; }
+    if (times.length < 2) { el.textContent = "Estimated wait: unknown (no recent matches)."; return; }
+    const gaps = [];
+    for (let i = 1; i < times.length; i++) gaps.push((times[i] - times[i - 1]) / 60000);
+    gaps.sort((a, b) => a - b);
+    const med = gaps[Math.floor(gaps.length / 2)];
+    const sizes = (matches || []).slice(-20).map((m) => (m.players || []).length).filter((n) => n > 0).sort((a, b) => a - b);
+    const medSize = sizes.length ? sizes[Math.floor(sizes.length / 2)] : 8;
+    const eta = med * Math.max(1, Math.ceil(q / Math.max(1, medSize)));
+    el.textContent = `Estimated wait: ~${eta < 1 ? "<1" : Math.round(eta)} min at recent pace (${q} waiting, median match every ${med.toFixed(0)} min).`;
+  } catch (e) { el.textContent = "Estimated wait: unknown."; }
+}
+
+/* ---------- grant presets + CSV export (local conveniences) ---------- */
+function grantPresets() {
+  try { return JSON.parse(localStorage.getItem("dn-grant-presets") || "[]"); }
+  catch (e) { return []; }
+}
+function saveGrantPresets(list) {
+  localStorage.setItem("dn-grant-presets", JSON.stringify(list));
+}
+function refreshPresetSelect() {
+  const sel = $("grant-preset");
+  const list = grantPresets();
+  sel.innerHTML = list.length
+    ? list.map((p, i) => `<option value="${i}">${esc(p.name)}</option>`).join("")
+    : `<option value="">(no presets saved)</option>`;
+}
+function downloadCSV(name, rows) {
+  const csv = rows.map((r) => r.map((c) => `"${String(c == null ? "" : c).replace(/"/g, '""')}"`).join(",")).join("\n");
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+
+/* ---------- sleepers, wealth, ships, modes ---------- */
+async function loadSleepers() {
+  const days = $("sleepers-days").value || "30";
+  try {
+    const data = await api("/api/sleepers?days=" + encodeURIComponent(days));
+    const list = data.sleepers || [];
+    $("sleepers-count").textContent = list.length + " dormant";
+    const tb = tbodyFor("sleepers-table");
+    tb.innerHTML = "";
+    for (const s of list) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td>${esc(s.name) || "–"}</td><td>${esc(s.rank)}</td><td>${esc(s.last_login)}</td>`;
+      tb.appendChild(tr);
+    }
+    if (!list.length) tb.innerHTML = '<tr><td colspan="3" class="muted">Everybody active. Nice.</td></tr>';
+  } catch (e) { toast("Sleepers: " + e.message, "err"); }
+}
+
+async function loadWealth() {
+  try {
+    const data = await api("/api/wealth");
+    const bands = data.bands || [];
+    const max = Math.max(1, ...bands.map((b) => b.count || 0));
+    $("wealth-box").innerHTML = bands.map((b) => {
+      const pct = Math.round((100 * (b.count || 0)) / max);
+      return `<div style="display:flex;align-items:center;gap:10px;margin:3px 0;font-size:13px">
+        <span style="min-width:110px" class="muted">${esc(b.label)}</span>
+        <div style="flex:1;height:12px;background:#0c1621;border:1px solid #24405a;border-radius:4px">
+          <div style="width:${pct}%;height:100%;background:#fbbf24;border-radius:3px"></div></div>
+        <span style="min-width:60px">${esc(b.count)}</span></div>`;
+    }).join("") || '<p class="muted">No accounts.</p>';
+  } catch (e) { /* card stays blank */ }
+}
+
+async function loadShips() {
+  try {
+    const data = await api("/api/ships");
+    const tb = tbodyFor("ships-table");
+    tb.innerHTML = "";
+    for (const s of (data.ships || [])) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td>${esc(s.name)}</td><td>${Number(s.xp).toLocaleString()}</td><td>${esc(s.pilots)}</td>`;
+      tb.appendChild(tr);
+    }
+    if (!(data.ships || []).length) tb.innerHTML = '<tr><td colspan="3" class="muted">No ship XP recorded yet — fly first.</td></tr>';
+  } catch (e) { toast("Ships: " + e.message, "err"); }
+}
+
+async function loadModeStats() {
+  try {
+    const data = await api("/api/mode-stats");
+    const tb = tbodyFor("modes-table");
+    tb.innerHTML = "";
+    for (const m of (data.modes || [])) {
+      const wr = m.results ? Math.round((100 * m.wins) / m.results) : 0;
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td>${esc(m.mode)}</td><td>${esc(m.matches)}</td><td>${esc(m.wins)}</td><td>${wr}%</td><td>${esc(m.kills)}</td>`;
+      tb.appendChild(tr);
+    }
+    if (!(data.modes || []).length) tb.innerHTML = '<tr><td colspan="5" class="muted">No matches reported yet.</td></tr>';
+  } catch (e) { toast("Modes: " + e.message, "err"); }
+}
+
 /* ---------- queue ---------- */
 async function loadQueue() {
   try {
@@ -270,6 +569,9 @@ async function loadQueue() {
       tb.appendChild(tr);
     }
     drawHistory($("chart-queue"), state.history.length ? state.history : [{ t: 0, q: entries.length, m: 0, i: 0 }]);
+    state.lastQueue = entries;
+    updateQueueETA(state.historyData);
+    if (!state.historyData) heatmapData().then((d) => { state.historyData = d; updateQueueETA(d); });
   } catch (e) { toast("Queue: " + e.message, "err"); }
 }
 
@@ -779,12 +1081,13 @@ async function showMatchDetail(id) {
       } catch (e) { /* logs optional */ }
     }
     const rows = slots.map((s) => `<td><code>${esc(s.user_id.slice(0, 8))}…</code></td><td>${esc(s.team)}</td>`).join("");
+    const balance = await showTeamBalance(slots);
     box.innerHTML = `<dl class="kv">
       <dt>mode</dt><dd>${esc(m.game_mode)} on ${esc(m.map)}</dd>
       <dt>status</dt><dd>${esc(m.status)} · teams ${t1}v${t2}</dd>
       <dt>address</dt><dd>${esc(m.server_ip)}:${esc(m.server_port)}</dd>
       <dt>formed</dt><dd>${esc(m.created_at)}${m.server_ready_at ? " · host ready " + esc(m.server_ready_at) : ""}</dd>
-      ${extra}${logHint}</dl>
+      ${extra}${logHint}${balance}</dl>
       <div class="table-wrap"><table><thead><tr><th>Player</th><th>Team</th></tr></thead><tbody>${rows || '<tr><td colspan="2" class="muted">No slots.</td></tr>'}</tbody></table></div>`;
   } catch (e) { box.innerHTML = `<p class="error">${esc(e.message)}</p>`; }
 }
@@ -841,6 +1144,7 @@ async function loadHistory() {
   try {
     const data = await api("/api/history?limit=30");
     const list = data.matches || [];
+    state.historyData = list;
     $("history-count").textContent = list.length + " matches";
     const tb = tbodyFor("history-table");
     tb.innerHTML = "";
@@ -897,7 +1201,37 @@ async function loadAudit() {
       tr.innerHTML = `<td>${esc(time)}</td><td><code>${esc(action)}</code></td><td>${esc(detail)}</td>`;
       tb.appendChild(tr);
     }
+    renderAuditTimeline(list);
   } catch (e) { toast("Audit: " + e.message, "err"); }
+}
+
+// Operator actions per day (last 14 days with entries): which days were busy.
+function renderAuditTimeline(list) {
+  const box = $("audit-timeline");
+  const byDay = {};
+  for (const line of (list || [])) {
+    try {
+      const o = JSON.parse(line);
+      const day = String(o.time || "").slice(0, 10);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) continue;
+      byDay[day] = byDay[day] || {};
+      byDay[day][o.action || "?"] = (byDay[day][o.action || "?"] || 0) + 1;
+    } catch (e) { /* raw line */ }
+  }
+  const days = Object.keys(byDay).sort().slice(-14);
+  if (!days.length) { box.innerHTML = '<p class="muted">No timestamped actions yet.</p>'; return; }
+  const max = Math.max(...days.map((d) => Object.values(byDay[d]).reduce((a, b) => a + b, 0)));
+  box.innerHTML = days.map((d) => {
+    const total = Object.values(byDay[d]).reduce((a, b) => a + b, 0);
+    const top = Object.entries(byDay[d]).sort((a, b) => b[1] - a[1]).slice(0, 3)
+      .map(([a, n]) => `${a} ×${n}`).join(", ");
+    const pct = max ? Math.round((100 * total) / max) : 0;
+    return `<div style="display:flex;align-items:center;gap:10px;margin:3px 0;font-size:13px">
+      <span style="min-width:100px" class="muted">${esc(d)}</span>
+      <div style="flex:1;height:12px;background:#0c1621;border:1px solid #24405a;border-radius:4px">
+        <div style="width:${pct}%;height:100%;background:#6ea8fe;border-radius:3px"></div></div>
+      <span style="min-width:220px">${esc(top)} (${total})</span></div>`;
+  }).join("");
 }
 
 /* ---------- crash reports ---------- */
@@ -993,10 +1327,302 @@ async function showPlayerProgress(pid) {
   } catch (e) { return `<p class="error">${esc(e.message)}</p>`; }
 }
 
+/* ---------- markers, search, balance, economy, sessions, maintenance ---------- */
+let markerCache = [];
+
+// drawSpark paints a filled area sparkline into an <svg> that sits BEHIND
+// the tile text (CSS .spark): same tile size, no layout change. Flat lines
+// (all zeros / single value) render as a baseline, never as an error.
+// markers draw as vertical lines when their timestamp falls in [from, to].
+function drawSpark(svg, points, color, markers, from, to) {
+  if (!svg) return;
+  const W = 100, H = 30;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.innerHTML = "";
+  const ns = "http://www.w3.org/2000/svg";
+  if (points && points.length >= 2) {
+    const vals = points.map((p) => +p[1] || 0);
+    const max = Math.max(...vals);
+    const min = Math.min(...vals);
+    const span = max - min || 1;
+    const step = W / (vals.length - 1);
+    let d = "";
+    vals.forEach((v, i) => {
+      const x = (i * step).toFixed(1);
+      const y = (H - 2 - ((v - min) / span) * (H - 5)).toFixed(1);
+      d += (i ? "L" : "M") + x + " " + y;
+    });
+    const area = document.createElementNS(ns, "path");
+    area.setAttribute("d", d + `L${W} ${H}L0 ${H}Z`);
+    area.setAttribute("fill", color);
+    area.setAttribute("opacity", "0.25");
+    const line = document.createElementNS(ns, "path");
+    line.setAttribute("d", d);
+    line.setAttribute("fill", "none");
+    line.setAttribute("stroke", color);
+    line.setAttribute("stroke-width", "1.2");
+    line.setAttribute("vector-effect", "non-scaling-stroke");
+    svg.appendChild(area);
+    svg.appendChild(line);
+  }
+  if (markers && from && to) {
+    const f = new Date(from).getTime(), t = new Date(to).getTime();
+    if (t > f) {
+      for (const m of markers) {
+        const mt = m.t * 1000;
+        if (mt < f || mt > t) continue;
+        const x = ((mt - f) / (t - f)) * W;
+        const ln = document.createElementNS(ns, "line");
+        ln.setAttribute("x1", x); ln.setAttribute("x2", x);
+        ln.setAttribute("y1", 0); ln.setAttribute("y2", H);
+        ln.setAttribute("stroke", "#fbbf24");
+        ln.setAttribute("stroke-width", "0.8");
+        const title = document.createElementNS(ns, "title");
+        title.textContent = m.label || "";
+        ln.appendChild(title);
+        svg.appendChild(ln);
+      }
+    }
+  }
+}
+
+async function loadMarkers() {
+  try {
+    const data = await api("/api/events");
+    markerCache = data.events || [];
+  } catch (e) { markerCache = []; }
+  const box = $("marker-list");
+  box.innerHTML = "";
+  for (const m of markerCache) {
+    const div = document.createElement("div");
+    div.className = "ev";
+    div.innerHTML = `<span class="ts">${esc(new Date(m.t * 1000).toLocaleString())}</span> — ${esc(m.label)}`;
+    const del = document.createElement("button");
+    del.className = "btn small danger";
+    del.textContent = "✕";
+    del.onclick = async () => {
+      await api("/api/events/" + encodeURIComponent(m.id), { method: "DELETE" }).catch((e) => toast(e.message, "err"));
+      loadMarkers();
+      loadSeries();
+    };
+    div.appendChild(del);
+    box.appendChild(div);
+  }
+  if (!markerCache.length) box.innerHTML = '<p class="muted">No markers — restarts and deploys land here.</p>';
+}
+
+async function globalSearch() {
+  const q = ($("global-search").value || "").trim().toLowerCase();
+  if (!q) return;
+  try {
+    const data = await api("/api/accounts");
+    const hit = (data.accounts || []).find((a) =>
+      (a.username || "").toLowerCase().includes(q) || (a.email || "").toLowerCase().includes(q) ||
+      (a.player_id || "").toLowerCase() === q || (a.id || "").toLowerCase() === q);
+    if (!hit) { toast("No account matches.", "err"); return; }
+    switchTab("players");
+    $("accounts-search").value = hit.username || hit.email || q;
+    if (!accountsCache.length) await loadPlayers();
+    renderPlayers();
+    toast(`Found ${hit.username || hit.email}.`, "ok");
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function showTeamBalance(slots) {
+  // Average rank + kills per team: are matches fair?
+  try {
+    const data = await api("/api/accounts");
+    const byPid = {};
+    for (const a of (data.accounts || [])) {
+      if (a.player_id) byPid[String(a.player_id).toLowerCase()] = a;
+    }
+    const teams = {};
+    for (const s of (slots || [])) {
+      const t = s.team || 0;
+      teams[t] = teams[t] || { n: 0, rank: 0, kills: 0 };
+      const a = byPid[String((s.user_id || "").replace(/-/g, "").toLowerCase())];
+      teams[t].n++;
+      if (a) { teams[t].rank += a.rank || 0; teams[t].kills += a.kills || 0; }
+    }
+    const rows = Object.entries(teams).map(([t, v]) =>
+      `<dt>team ${esc(t)}</dt><dd>${v.n} pilots · avg rank ${(v.n ? v.rank / v.n : 0).toFixed(1)} · ${v.kills} kills</dd>`).join("");
+    return rows ? `<dt>balance</dt><dd><dl class="kv">${rows}</dl></dd>` : "";
+  } catch (e) { return ""; }
+}
+
+async function loadEconomyAndSessions() {
+  try {
+    const data = await api(`/api/series?metrics=${encodeURIComponent("credits,spending,online")}&range=${encodeURIComponent(state.range)}`);
+    const series = data.series || {};
+    const pay = series.credits || {}, spend = series.spending || {}, online = series.online || {};
+    $("eco-payouts").textContent = fmtNum(pay.total) + " credits";
+    $("eco-spending").textContent = fmtNum(spend.total) + " credits";
+    drawSpark($("spark-eco-payouts"), pay.points, "#34d399");
+    drawSpark($("spark-eco-spending"), spend.points, "#fbbf24");
+    const net = (pay.total || 0) - (spend.total || 0);
+    $("eco-note").textContent = `net ${net >= 0 ? "+" : ""}${fmtNum(net)} credits in range · faucet vs sink`;
+    // Sessions from the online line: peak, average, span.
+    const pts = online.points || [];
+    const vals = pts.map((p) => +p[1] || 0);
+    if (!vals.length) {
+      $("session-box").innerHTML = '<p class="muted">No samples in range yet.</p>';
+      return;
+    }
+    let peak = 0, peakT = 0, sum = 0;
+    vals.forEach((v, i) => {
+      sum += v;
+      if (v > peak) { peak = v; peakT = pts[i][0]; }
+    });
+    const byHour = Array(24).fill(0), byHourN = Array(24).fill(0);
+    pts.forEach((p) => {
+      const h = new Date(p[0] * 1000).getHours();
+      byHour[h] += +p[1] || 0; byHourN[h]++;
+    });
+    let bestH = 0;
+    byHour.forEach((v, h) => { if (byHourN[h] && v / byHourN[h] > (byHour[bestH] / Math.max(1, byHourN[bestH]))) bestH = h; });
+    // Busiest weekday from the same points.
+    const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const byDay = Array(7).fill(0), byDayN = Array(7).fill(0);
+    pts.forEach((p) => {
+      const d = new Date(p[0] * 1000).getDay();
+      byDay[d] += +p[1] || 0; byDayN[d]++;
+    });
+    let bestD = 0;
+    byDay.forEach((v, d) => { if (byDayN[d] && v / byDayN[d] > (byDay[bestD] / Math.max(1, byDayN[bestD]))) bestD = d; });
+    $("session-box").innerHTML = `<dl class="kv">
+      <dt>peak online</dt><dd>${peak} (${peakT ? new Date(peakT * 1000).toLocaleString() : "–"})</dd>
+      <dt>average online</dt><dd>${(sum / vals.length).toFixed(1)}</dd>
+      <dt>busiest hour</dt><dd>${bestH}:00–${bestH}:59</dd>
+      <dt>busiest weekday</dt><dd>${days[bestD]}</dd>
+      <dt>samples</dt><dd>${vals.length} points in range</dd></dl>`;
+  } catch (e) { /* cards stay blank, tiles carry the page */ }
+}
+
+async function setMaintenance(on) {
+  const msg = ($("maint-message").value || "").trim() || "Maintenance in progress — servers restart shortly.";
+  try {
+    if (on) {
+      if (!confirm("Start maintenance mode? Launcher tile + chat broadcast go out now.")) return;
+      await api("/api/tiles", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: "maintenance", type: "maintenance", section_size: "full", title: "Maintenance", body: msg, active: true }),
+      });
+      await api("/api/broadcast", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ channel: "dreadnought.global", content: "[Maintenance] " + msg }),
+      });
+      $("maint-state").textContent = "Maintenance ON since " + new Date().toLocaleTimeString() + ".";
+      toast("Maintenance mode on.", "ok");
+    } else {
+      await api("/api/tiles/maintenance", { method: "DELETE" }).catch(() => {});
+      await api("/api/broadcast", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ channel: "dreadnought.global", content: "[Maintenance] All clear — servers are back." }),
+      });
+      $("maint-state").textContent = "Maintenance ended " + new Date().toLocaleTimeString() + ".";
+      toast("Maintenance mode off.", "ok");
+    }
+    if (state.currentTab === "news") loadTiles();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+/* ---------- setup & services (first run + control) ---------- */
+let setupTimer = null;
+
+async function loadSetup() {
+  let st;
+  try {
+    st = await api("/api/setup-state");
+  } catch (e) { toast("Setup: " + e.message, "err"); return; }
+  const item = (ok, label, sub) =>
+    `<dt>${ok ? "✅" : "⬜"}</dt><dd>${esc(label)}${sub ? ` <span class="muted-sm">${esc(sub)}</span>` : ""}</dd>`;
+  $("setup-checklist").innerHTML = "<dl class=\"kv\">" + [
+    item(st.secrets_env_exists, "run/secrets.env exists", st.secrets_env_exists ? "" : "write it below, then run setup"),
+    item(st.jwt_set, "JWT_SECRET set", ""),
+    item(st.admin_set, "ADMIN_KEY in secrets.env", "dashboard key source: " + (st.key_source || "?")),
+    item(st.game_binary_exists, "GAME_BINARY", st.game_binary || "(unset — no battle servers without it)"),
+    item(st.go_present, "Go toolchain", st.go_present ? "" : "install golang (or build elsewhere)"),
+    item(st.wine_present, "Wine", st.wine_present ? "" : "optional — battle servers need it"),
+  ].join("") + "</dl>";
+  $("setup-banner").style.display = st.secrets_env_exists ? "none" : "";
+  const tb = tbodyFor("svc-table");
+  tb.innerHTML = "";
+  const names = Object.keys(st.running || {}).sort();
+  for (const name of names) {
+    const up = st.running[name];
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td><code>${esc(name)}</code></td>
+      <td>${up ? '<span class="badge ok">running</span>' : '<span class="badge warn">stopped</span>'}</td><td></td>`;
+    const cell = tr.lastChild;
+    if (up) {
+      const b = document.createElement("button");
+      b.className = "btn small danger";
+      b.textContent = "Stop";
+      b.onclick = () => confirmAction("Stop service?", `${name} gets SIGTERM (pidfile-checked).`, async () => {
+        await api("/api/services/stop/" + name, { method: "POST" });
+        toast(name + " stopped.", "ok");
+        loadSetup();
+      });
+      cell.appendChild(b);
+    } else {
+      cell.innerHTML = '<span class="muted">Start all to start</span>';
+    }
+    tb.appendChild(tr);
+  }
+  $("setup-job").textContent = st.job_running ? ("running: " + st.job_running) : "";
+  loadSetupLog(false);
+}
+
+async function runJob(path, label) {
+  try {
+    await api(path, { method: "POST" });
+    toast(label + " started — watch the job log.", "ok");
+    loadSetupLog(true);
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function loadSetupLog(follow) {
+  try {
+    const data = await api("/api/setup-log?lines=200");
+    const el = $("setup-log");
+    el.textContent = (data.lines || []).join("\n") || "(empty — run setup or start services)";
+    if (follow || ($("setup-follow") && $("setup-follow").checked)) el.scrollTop = el.scrollHeight;
+    $("setup-job").textContent = data.running ? ("running: " + data.running) : "";
+  } catch (e) { /* log optional */ }
+}
+
+async function loadSecrets() {
+  try {
+    const data = await api("/api/secrets");
+    if (!loadSecrets.touched) $("secrets-text").value = data.content || "";
+  } catch (e) { toast("Secrets: " + e.message, "err"); }
+}
+
+async function saveSecrets() {
+  try {
+    await api("/api/secrets", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content: $("secrets-text").value }),
+    });
+    loadSecrets.touched = false;
+    toast("secrets.env saved (mode 600). Services pick it up on (re)start.", "ok");
+    loadSetup();
+  } catch (e) { toast(e.message, "err"); }
+}
+
 /* ---------- polling ---------- */
 async function refreshAll() {
   try { await api("/api/me"); hideLogin(); } catch { showLogin(); return; }
-  if (state.currentTab === "overview") loadStatus();
+  // First run: no secrets.env yet — land on the Setup tab, not the overview.
+  try {
+    const st = await api("/api/setup-state");
+    if (!st.secrets_env_exists) {
+      switchTab("setup");
+      toast("Welcome — no secrets.env yet. Work through Setup, then start everything.", "ok");
+      return;
+    }
+  } catch (e) { /* setup-state optional; fall through */ }
+  if (state.currentTab === "overview") { loadStatus(); loadSeries(); loadEconomyAndSessions(); }
   else switchTab(state.currentTab);
 }
 
@@ -1045,6 +1671,82 @@ document.addEventListener("DOMContentLoaded", () => {
   $("servers-reload").onclick = loadServers;
   $("chat-reload").onclick = loadChat;
   $("metrics-reload").onclick = loadMetrics;
+  $("setup-reload").onclick = loadSetup;
+  $("svc-start-all").onclick = () => runJob("/api/services/start-all", "Start all");
+  $("svc-stop-all").onclick = () => confirmAction("Stop ALL services?", "The whole stack (not this dashboard) goes down.", () => runJob("/api/services/stop-all", "Stop all"));
+  $("setup-run").onclick = () => confirmAction("Run setup?", "scripts/setup.sh builds everything (takes minutes).", () => runJob("/api/setup/run", "Setup"));
+  $("setup-log-reload").onclick = () => loadSetupLog(true);
+  $("secrets-reload").onclick = () => { loadSecrets.touched = false; loadSecrets(); };
+  $("secrets-save").onclick = saveSecrets;
+  $("secrets-text").oninput = () => { loadSecrets.touched = true; };
+  setupTimer = setInterval(() => { if (state.currentTab === "setup") loadSetupLog(false); }, 5000);
+  $("sleepers-reload").onclick = loadSleepers;
+  $("sleepers-days").onchange = loadSleepers;
+  $("reports-reload").onclick = loadReports;
+  $("sla-reload").onclick = loadSLA;
+  $("marker-add").onclick = async () => {
+    const label = ($("marker-label").value || "").trim();
+    if (!label) { toast("Label the marker first.", "err"); return; }
+    try {
+      await api("/api/events", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ label }),
+      });
+      $("marker-label").value = "";
+      toast("Marker added.", "ok");
+      loadMarkers();
+      loadSeries();
+    } catch (e) { toast(e.message, "err"); }
+  };
+  $("global-search").addEventListener("keydown", (e) => { if (e.key === "Enter") globalSearch(); });
+  $("maint-start").onclick = () => setMaintenance(true);
+  $("maint-stop").onclick = () => setMaintenance(false);
+  $("accounts-csv").onclick = () => {
+    const rows = [["username", "email", "player_id", "credits", "premium", "free_xp", "rank", "ships", "matches", "wins", "kills", "banned"]];
+    for (const a of (accountsCache || [])) rows.push([a.username, a.email, a.player_id, a.credits, a.premium, a.free_xp, a.rank, a.ships, a.matches, a.wins, a.kills, a.banned]);
+    downloadCSV("dreadnought-players.csv", rows);
+    toast("Players CSV downloaded.", "ok");
+  };
+  $("history-csv").onclick = async () => {
+    const data = await api("/api/history?limit=500").catch((e) => { toast(e.message, "err"); return null; });
+    if (!data) return;
+    const rows = [["id", "mode", "map", "started_at", "players"]];
+    for (const m of (data.matches || [])) rows.push([m.id, m.mode, m.map, m.started_at, (m.players || []).length]);
+    downloadCSV("dreadnought-matches.csv", rows);
+    toast("Matches CSV downloaded.", "ok");
+  };
+  $("grant-preset-apply").onclick = () => {
+    const list = grantPresets();
+    const p = list[+$("grant-preset").value];
+    if (!p) { toast("No preset selected.", "err"); return; }
+    $("grant-all-credits").value = p.credits; $("grant-all-premium").value = p.premium; $("grant-all-xp").value = p.xp;
+    toast(`Preset "${p.name}" filled in — press Give to all to run it.`, "ok");
+  };
+  $("grant-preset-save").onclick = () => {
+    const name = prompt("Preset name?", "Event kit");
+    if (!name || !name.trim()) return;
+    const list = grantPresets();
+    list.push({ name: name.trim(), credits: +$("grant-all-credits").value || 0, premium: +$("grant-all-premium").value || 0, xp: +$("grant-all-xp").value || 0 });
+    saveGrantPresets(list);
+    refreshPresetSelect();
+    toast("Preset saved (this browser).", "ok");
+  };
+  $("grant-preset-del").onclick = () => {
+    const list = grantPresets();
+    const i = +$("grant-preset").value;
+    if (!list[i]) { toast("No preset selected.", "err"); return; }
+    if (!confirm(`Delete preset "${list[i].name}"?`)) return;
+    list.splice(i, 1);
+    saveGrantPresets(list);
+    refreshPresetSelect();
+  };
+  refreshPresetSelect();
+  document.querySelectorAll("#rangebar button").forEach((b) => { b.onclick = () => setRange(b.dataset.range); });
+  tickClock();
+  setInterval(tickClock, 1000);
+  refreshAll();
+  setInterval(() => { if (state.currentTab === "overview") loadSeries(); }, 60000);
+  if (state.currentTab === "overview") loadSeries();
   $("log-reload").onclick = loadLog;
   $("log-source").onchange = () => { $("log-file").innerHTML = ""; loadLog(); };
   $("log-file").onchange = loadLog;
