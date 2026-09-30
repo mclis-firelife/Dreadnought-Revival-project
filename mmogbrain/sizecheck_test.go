@@ -205,11 +205,7 @@ var targetSizes = map[string]int{
 	// where the parser (0x2A796D0 -> player-data +0x3F90) reads it, and now
 	// includes the per-ship ids of the default player's fitted defaults, so the
 	// ship's own modules read as owned instead of asking to be researched.
-	// 436 -> 492 (+56): owned HULL precast ids join the list, so a hull the
-	// player owns (e.g. starter hulls, which have no purchase row) satisfies
-	// its children's prerequisite walk — T2 no longer stays padlocked on a
-	// fully researched T1 line.
-	"YA_GetPlayerPurchases": 492,
+	"YA_GetPlayerPurchases": 436,
 	// Was 305, then 233 after removing fabricated Eligible/isEligible bool
 	// fields (issue #51 — zero footprint in the client binary). Now 953: the
 	// body is the FleetTypes/Maintenance shape FUN_142a78790 actually parses,
