@@ -407,6 +407,21 @@ func handlePlayerGetSatisfied(log *logrus.Logger, conn net.Conn, remote string, 
 	if err := flushPendingTechTree(log, conn, remote, appEncoder, encryptResponses, state); err != nil {
 		return err
 	}
+	// The owned items that did not fit YA_PlayerGet. DN_PUSH_INVENTORY=off
+	// disables it, =always sends it on every login.
+	if mode := os.Getenv("DN_PUSH_INVENTORY"); mode != "off" {
+		if _, cut := inventoryNeedsPush.LoadAndDelete(state.playerPID); cut || mode == "always" {
+			if pushID, err := uuid.NewRandom(); err == nil {
+				payload := buildMmogPushInventoryPayload(state.playerPID)
+				push := protocol.BuildResponseFrame(pushID, state.lastMsgType, payload)
+				if err := writeMmogAppResponse(log, conn, remote, pushID, "YA_PushInventory", push,
+					appEncoder, encryptResponses, "inventory push failed", "sent YA_PushInventory"); err != nil {
+					return err
+				}
+				log.WithFields(logrus.Fields{"remote": remote, "player": state.playerPID, "bytes": len(payload)}).Warn("mmog: owned list delivered in YA_PushInventory")
+			}
+		}
+	}
 	armMatchPushForActiveMatch(log, remote, state)
 	log.WithFields(logrus.Fields{
 		"remote": remote,
@@ -683,6 +698,22 @@ func processMmogAppFrames(log *logrus.Logger, conn net.Conn, remote string, fram
 			if err := writeMmogAppResponse(log, conn, remote, frame.RequestID, requestName, response, appEncoder, encryptResponses, "request response failed", "sent request response"); err != nil {
 				return err
 			}
+			// A ship just claimed by research goes to the client now, not at
+			// the next login (buildMmogShipClaimPush). Before the fleet
+			// update below, so the fleets can name it.
+			if requestName == "YA_UnlockItem" {
+				shipID := firstMmogInt32Field(frame.Payload, "ItemID", "itemID", "itemId")
+				if takeNewlyClaimedShip(state.playerPID, shipID) {
+					if payload, ok := buildMmogShipClaimPush(state.playerPID, shipID); ok {
+						if pushID, err := uuid.NewRandom(); err == nil {
+							push := protocol.BuildResponseFrame(pushID, frame.MsgType, payload)
+							if err := writeMmogAppResponse(log, conn, remote, pushID, "YA_ClaimItem", push, appEncoder, encryptResponses, "ship claim push failed", "sent YA_ClaimItem push for a claimed ship"); err != nil {
+								return err
+							}
+						}
+					}
+				}
+			}
 			// A ship just researched (claimed) or bought can unlock a fleet
 			// (unlockedFleets), and the client learns its fleets only from
 			// YA_PlayerFleets / YA_FleetUpdate -- so without this the Veteran or
@@ -776,6 +807,16 @@ func processMmogAppFrames(log *logrus.Logger, conn net.Conn, remote string, fram
 			// rebuilt after that push and never re-reads it. Sending the balance
 			// again here is harmless -- the YA_RewardCurrencies handler ASSIGNS
 			// Credits/Points (0x142A2C56D) rather than adding them.
+			// The converter charges GP, and its reply handler does not touch
+			// the GP balance: send the new one right after it.
+			if requestName == "YA_ConvertShipXP" {
+				if pushID, err := uuid.NewRandom(); err == nil {
+					push := protocol.BuildResponseFrame(pushID, frame.MsgType, buildMmogRewardCurrenciesPayload(state.playerPID))
+					if err := writeMmogAppResponse(log, conn, remote, pushID, "YA_RewardCurrencies", push, appEncoder, encryptResponses, "currency push failed", "sent YA_RewardCurrencies push after XP conversion"); err != nil {
+						return err
+					}
+				}
+			}
 			if requestName == "YA_RefreshPlayerProfile" {
 				if pushID, err := uuid.NewRandom(); err == nil {
 					push := protocol.BuildResponseFrame(pushID, frame.MsgType, buildMmogRewardCurrenciesPayload(state.playerPID))
@@ -1055,34 +1096,13 @@ func connectPushGateOpen(status mmogMatchmakingStatus) (bool, string) {
 }
 
 func writeMmogAppResponse(log *logrus.Logger, conn net.Conn, remote string, requestID [16]byte, requestName string, response []byte, appEncoder *protocol.StreamCipher, encryptResponses bool, warnMsg string, infoMsg string) error {
-	wire := response
-	if encryptResponses {
-		if appEncoder == nil {
-			log.WithField("request", fmt.Sprintf("%x", requestID)).Warn("mmog: encrypt requested but encoder is nil")
-			return fmt.Errorf("encrypt requested but encoder is nil")
-		}
-		wire = appEncoder.Encrypt(response)
+	if encryptResponses && appEncoder == nil {
+		log.WithField("request", fmt.Sprintf("%x", requestID)).Warn("mmog: encrypt requested but encoder is nil")
+		return fmt.Errorf("encrypt requested but encoder is nil")
 	}
-	// Frame-header correlation diagnostics: decode the outgoing frame header so we
-	// can confirm the client can actually match this response to its request.
 	// response is the full built frame: magic(2) size(2) type(2) reqID(16) payload.
-	// Key things this surfaces: (1) the 16-bit `size` header field overflows for
-	// payloads >~65513 bytes (e.g. YA_Tune), which would desync the client's frame
-	// reader for every following frame; (2) whether the embedded request ID matches
-	// the request we're answering.
-	if len(response) > 0xffff {
-		// The 16-bit frame size field cannot represent this length; sending it
-		// would desync the client's frame stream and corrupt every following
-		// response (this is exactly what an oversized YA_Tune did). Refuse rather
-		// than silently corrupt the connection.
-		log.WithFields(logrus.Fields{
-			"remote":     remote,
-			"name":       requestName,
-			"frame_size": len(response),
-			"max":        0xffff,
-		}).Error("mmog: response frame exceeds 16-bit size limit; not sending (would desync stream)")
-		return fmt.Errorf("mmog response %q too large for frame: %d bytes", requestName, len(response))
-	}
+	// Check the embedded request id: a mismatch means the client cannot match
+	// this response to its request.
 	if len(response) >= 22 {
 		embeddedID := response[6:22]
 		if !bytes.Equal(embeddedID, requestID[:]) {
@@ -1094,19 +1114,58 @@ func writeMmogAppResponse(log *logrus.Logger, conn net.Conn, remote string, requ
 			}).Warn("mmog: response frame request-id mismatch (client cannot correlate)")
 		}
 	}
-	if _, err := conn.Write(wire); err != nil {
-		log.WithError(err).WithField("remote", remote).Warn("mmog: " + warnMsg)
-		return err
+	// A response larger than one frame goes out as several (see
+	// protocol.SplitResponseFrame): the client reassembles frames that share a
+	// request id until one carries the last-frame flag. One frame must fit the
+	// client's 32 KB receive ring, which is why every large response used to be
+	// truncated or emptied to a budget. DN_FRAME_CHUNKING=0 restores the old
+	// single-frame behaviour, under which a frame over 0xffff bytes cannot even
+	// be represented and is refused rather than desyncing the stream.
+	parts := [][]byte{response}
+	if frameChunkingEnabled() {
+		parts = protocol.SplitResponseFrame(response, protocol.MaxChunkFrame)
+	} else if len(response) > 0xffff {
+		log.WithFields(logrus.Fields{
+			"remote":     remote,
+			"name":       requestName,
+			"frame_size": len(response),
+			"max":        0xffff,
+		}).Error("mmog: response frame exceeds 16-bit size limit; not sending (would desync stream)")
+		return fmt.Errorf("mmog response %q too large for frame: %d bytes", requestName, len(response))
 	}
-	log.WithFields(logrus.Fields{
+	cipherBytes := 0
+	for _, part := range parts {
+		wire := part
+		if encryptResponses {
+			wire = appEncoder.Encrypt(part)
+		}
+		if _, err := conn.Write(wire); err != nil {
+			log.WithError(err).WithField("remote", remote).Warn("mmog: " + warnMsg)
+			return err
+		}
+		cipherBytes += len(wire)
+	}
+	fields := logrus.Fields{
 		"remote":       remote,
 		"request":      hex.EncodeToString(requestID[:]),
 		"name":         requestName,
 		"plain_bytes":  len(response),
-		"cipher_bytes": len(wire),
+		"cipher_bytes": cipherBytes,
 		"cipher":       encryptResponses,
-	}).Info("mmog: " + infoMsg)
+	}
+	if len(parts) > 1 {
+		fields["frames"] = len(parts)
+		log.WithFields(fields).Warn("mmog: " + infoMsg + " (split into frames)")
+		return nil
+	}
+	log.WithFields(fields).Info("mmog: " + infoMsg)
 	return nil
+}
+
+// frameChunkingEnabled reports whether oversized responses are split into
+// several frames (DN_FRAME_CHUNKING=0 turns it off).
+func frameChunkingEnabled() bool {
+	return os.Getenv("DN_FRAME_CHUNKING") != "0"
 }
 
 func isMmogPlayerMutationRequest(requestName string) bool {

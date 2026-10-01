@@ -304,6 +304,7 @@ func loadPersistedShipLoadouts(database *sql.DB, playerPID string) (map[int32]mm
 		}
 		loadout.playerLoadoutID = loadoutID
 		loadout.ship = persistedShipByID(shipID)
+		loadout.loadoutName = heroLoadoutName(loadout.precastLoadoutID, shipID, loadout.loadoutName)
 		if starter, ok := starterLoadoutByPrecastID(loadout.precastLoadoutID); ok {
 			loadout.fleetShipID = starter.fleetShipID
 		} else if loadout.precastLoadoutID != 0 {
@@ -1123,6 +1124,15 @@ type unlockOutcome struct {
 
 var lastUnlockOutcomes sync.Map // normalized pid + "|" + item id -> unlockOutcome
 
+// newlyClaimedShips marks ships granted by a research, until the connection
+// has pushed them to the client (takeNewlyClaimedShip).
+var newlyClaimedShips sync.Map // normalized pid + "|" + item id -> true
+
+func takeNewlyClaimedShip(playerPID string, itemID int32) bool {
+	_, ok := newlyClaimedShips.LoadAndDelete(unlockOutcomeKey(playerPID, itemID))
+	return ok
+}
+
 func unlockOutcomeKey(playerPID string, itemID int32) string {
 	return normalizedPlayerStatePID(playerPID) + "|" + strconv.Itoa(int(itemID))
 }
@@ -1158,6 +1168,10 @@ func persistUnlockItem(database *sql.DB, playerPID string, payload []byte) error
 	// cost ship XP nothing on our side.
 	shipXP := firstMmogInt32Field(payload, "ShipXp", "shipXp", "ShipXP")
 	shipKey, shipID, shipKnown := researchShip(itemID)
+	if !shipKnown && isOfficerBriefing(itemID) {
+		// A briefing id is the same on every ship; see officerResearchShip.
+		shipKey, shipID, shipKnown = officerResearchShip(playerPID, shipXP)
+	}
 	if shipXP < 0 || !shipKnown {
 		shipXP = 0
 	}
@@ -1256,6 +1270,11 @@ func persistUnlockItem(database *sql.DB, playerPID string, payload []byte) error
 	}
 	committed = true
 	outcome = unlockOutcome{succeeded: true, freeXPCharged: freeXP, shipXPCharged: shipXP}
+	if isShipItem(itemID) {
+		// A ship was just granted: the connection pushes it to the client
+		// (buildMmogShipClaimPush), which otherwise learns ships only at login.
+		newlyClaimedShips.Store(unlockOutcomeKey(playerPID, itemID), true)
+	}
 	if shipXP > 0 {
 		outcome.shipID = shipKey // the reply names it in the client's key space
 	}
@@ -1422,6 +1441,7 @@ func grantUnlockedShipLoadout(tx *sql.Tx, playerPID string, precastLoadoutID int
 	if authoritative, ok := dreadconfig.AuthoritativeShipName(shipID); ok {
 		name = authoritative
 	}
+	name = heroLoadoutName(precastLoadoutID, shipID, name)
 	var nextPosition int32
 	if err := tx.QueryRow(`SELECT COALESCE(MAX(position)+1,0) FROM player_ship_loadouts WHERE user_id=?`,
 		playerPID).Scan(&nextPosition); err != nil {
@@ -1635,4 +1655,28 @@ func researchedOrOwnedItemIDs(playerPID string) []int32 {
 		}
 	}
 	return ids
+}
+
+// heroLoadoutName is the name a hero loadout goes out with.
+//
+// A hero shares its pawn with a base hull -- the PCF Silesia flies the Furia's
+// pawn -- so naming a granted loadout after its PAWN (AuthoritativeShipName)
+// called 38 heroes on three accounts "Furia", "Nav", "Tugarin", "Orcus"...
+// The client shows the server's loadout name whenever it differs from the
+// blueprint's own, so those heroes were listed as base ships (operator,
+// 2026-10-01). A hero is named after its own blueprint (m_name); a stored name
+// that is exactly the pawn's base name is that mistake and is replaced, any
+// other stored name is kept.
+func heroLoadoutName(precastLoadoutID, shipID int32, stored string) string {
+	if (precastLoadoutID>>24)&0xff != mmogItemCategoryShipLoadoutHero {
+		return stored
+	}
+	own, ok := dreadconfig.CookedHeroName(precastLoadoutID)
+	if !ok || own == "" {
+		return stored
+	}
+	if base, ok := dreadconfig.AuthoritativeShipName(shipID); stored == "" || (ok && stored == base) {
+		return own
+	}
+	return stored
 }

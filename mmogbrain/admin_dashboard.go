@@ -79,6 +79,7 @@ func registerAdminDashboard(r *mux.Router, adminKey, controlPlaneURL, internalKe
 	api.HandleFunc("/wealth", adminAPIWealth).Methods(http.MethodGet)
 	api.HandleFunc("/ships", adminAPIShips).Methods(http.MethodGet)
 	api.HandleFunc("/mode-stats", adminAPIModeStats).Methods(http.MethodGet)
+	registerAdminPlayerManagement(api)
 }
 
 func writeAdminJSON(w http.ResponseWriter, v any) {

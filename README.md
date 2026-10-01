@@ -549,6 +549,13 @@ How it works:
   presence) — so double-play against an opted-out cluster is undetectable
   by design.
 
+## Credits
+
+- **Legojedi** — the launcher icon.
+- **gwog** ([@SyST3MDeV](https://github.com/SyST3MDeV)) — the Dreadnought SDK from the original [Dreadnought Revival Patch](https://github.com/SyST3MDeV/Dreadnought), which much of the client reverse engineering here builds on.
+- **House of Bards** ([@HouseOfBards101](https://github.com/HouseOfBards101)) — the client-side half of the work in [AGENT-CHAT.md](AGENT-CHAT.md): reverse engineering of the game client, the injected test mod (DreadnoughtTestBench), and in-match client behaviour.
+- **The Dreadnought community on Discord** — testing, bug reports and advice.
+
 ## Licence
 
 Apache License 2.0 — see [LICENSE](LICENSE).
